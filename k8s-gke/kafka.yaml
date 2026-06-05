@@ -18,6 +18,7 @@ spec:
         imagePullPolicy: Always
         ports:
         - containerPort: 9092
+        - containerPort: 29092
         env:
         - name: KAFKA_ADVERTISED_HOST
           value: "kafka"
@@ -26,11 +27,11 @@ spec:
             command:
             - /opt/kafka/bin/kafka-topics.sh
             - --bootstrap-server
-            - localhost:9092
+            - localhost:29092
             - --list
           initialDelaySeconds: 20
           periodSeconds: 10
-          timeoutSeconds: 10
+          timeoutSeconds: 25
           failureThreshold: 18
 ---
 apiVersion: v1
