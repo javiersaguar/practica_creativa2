@@ -400,6 +400,7 @@ Para GKE se pueden sobrescribir `ZONE`, `CLUSTER`, `K8S_NODE_COUNT` e `IMAGE_TAG
 
 1. **Arrancar con Docker Compose**
    Levanta los servicios, configura MinIO y Cassandra, crea la tabla Iceberg, entrena el modelo y arranca el predictor Spark Streaming.
+   En una VM limpia el primer arranque puede tardar 15-20 minutos por build de imágenes, arranque de Cassandra, creación Iceberg y entrenamiento `TrainModel`. Es normal que Cassandra tarde varios minutos en aceptar CQL.
 
 2. **Arrancar con Kubernetes (GKE)**
    Autentica con GKE, escala el cluster, detecta el tag real de los nodos y configura el firewall. Después crea Artifact Registry, construye y publica Spark/Kafka/Flask/Airflow, renderiza los manifests con el Project ID activo, distribuye los dos Spark workers entre nodos GKE, carga los datos por `stdin`, crea Cassandra e Iceberg, entrena, arranca el predictor y valida polling, Kafka, Cassandra, MongoDB, WebSocket y NodePorts.
@@ -440,16 +441,19 @@ La opción `11` muestra logs por servicio y logs de drivers dentro de los Spark 
 
 ### Error 1: la predicción se queda en `Processing...`
 
-**Causa:** predictor Spark detenido, error en el pipeline o checkpoints incompatibles.
+**Causa:** predictor Spark detenido, error en el pipeline o checkpoints incompatibles. En VMs lentas, un arranque antiguo podía dejar Flask muerto si Cassandra tardaba demasiado en aceptar conexiones; el bootstrap quedaba a medias y faltaban distancias, modelos o tabla Iceberg.
 
 **Solución:**
 
 ```text
+practica.sh -> 1         Relanzar arranque Docker; es idempotente y completa lo que falte
 practica.sh -> 10 -> 4   Diagnóstico WebSockets
 practica.sh -> 10 -> d   Diagnóstico deploy-mode cluster
 practica.sh -> 9         Limpiar checkpoints S3A Docker
 practica.sh -> 11        Logs por servicio
 ```
+
+La versión actual espera explícitamente a que Cassandra acepte CQL y a que Flask arranque conectado a Cassandra antes de continuar. Si un arranque fue interrumpido en una VM lenta, vuelve a ejecutar `./practica.sh` opción `1`; el script recrea tablas, recarga distancias, rehace Iceberg, reentrena y arranca el predictor sin intervención manual.
 
 ### Error 2: MLflow vacío o `TrainModel` no registra runs
 

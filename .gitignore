@@ -36,3 +36,4 @@ flight_prediction/target/
 flight_prediction/project/target/
 flight_prediction/project/project/target/
 kubectl
+.venv/

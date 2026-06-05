@@ -20,10 +20,11 @@ services:
     networks:
       - practica_net
     healthcheck:
-      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
-      interval: 30s
+      test: ["CMD-SHELL", "cqlsh -e \"SELECT now() FROM system.local\" >/dev/null 2>&1"]
+      interval: 10s
       timeout: 10s
-      retries: 5
+      retries: 90
+      start_period: 60s
 
   minio:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
@@ -156,14 +157,24 @@ services:
     ports:
       - "5001:5001"
     depends_on:
-      - mongo
-      - cassandra
-      - kafka
+      mongo:
+        condition: service_started
+      cassandra:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
     environment:
       PROJECT_HOME: /app
       MONGO_URI: mongodb://mongo:27017
       CASSANDRA_HOST: cassandra
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:5001/metrics', timeout=5).read()\""]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
     networks:
       - practica_net
 

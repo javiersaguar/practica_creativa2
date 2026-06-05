@@ -141,6 +141,29 @@ wait_for_airflow() {
     wait_until 180 5 "webserver Airflow tras restart" curl -fsS http://localhost:8081/health
 }
 
+cassandra_cql_ready_docker() {
+  docker exec cassandra cqlsh -e "SELECT now() FROM system.local;" >/dev/null 2>&1
+}
+
+wait_for_cassandra_docker() {
+  wait_until 900 5 "Cassandra aceptando CQL en 9042" cassandra_cql_ready_docker
+}
+
+flask_connected_to_cassandra_docker() {
+  [ "$(docker inspect -f '{{.State.Running}}' flask 2>/dev/null)" = "true" ] || return 1
+  curl -fsS http://localhost:5001/metrics >/dev/null 2>&1 || return 1
+  docker logs flask 2>&1 | grep -q "Cassandra ready: agile_data_science keyspace and tables available"
+}
+
+wait_for_flask_docker() {
+  if wait_until 420 5 "Flask conectado a Cassandra" flask_connected_to_cassandra_docker; then
+    return 0
+  fi
+  warn "Flask no quedo listo; reiniciando una vez"
+  docker compose restart flask >/dev/null || return 1
+  wait_until 420 5 "Flask conectado a Cassandra tras restart" flask_connected_to_cassandra_docker
+}
+
 active_predictor_driver_id() {
   curl -fsS http://localhost:8080/json/ 2>/dev/null | python3 -c '
 import json, sys
@@ -645,14 +668,14 @@ arrancar_docker() {
   docker compose up -d --build || { err "docker compose up --build fallo"; return 1; }
 
   info "Esperando a que Cassandra este lista..."
-  wait_until 300 5 "Cassandra" docker exec cassandra cqlsh -e "describe keyspaces" || return 1
+  wait_for_cassandra_docker || { err "Cassandra no acepto conexiones CQL"; return 1; }
   ok "Cassandra lista"
 
   info "Esperando Kafka, MinIO, Spark, Flask y Airflow..."
   wait_until 240 5 "Kafka" docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || return 1
   wait_until 180 5 "MinIO" docker exec minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc ready local" || return 1
   wait_until 180 5 "Spark UI" curl -fsS http://localhost:8080/json/ || return 1
-  wait_until 180 5 "Flask" curl -fsS http://localhost:5001/metrics || return 1
+  wait_for_flask_docker || { err "Flask no arranco conectado a Cassandra"; return 1; }
   wait_for_airflow || return 1
   ok "Servicios base listos"
 
@@ -666,7 +689,8 @@ arrancar_docker() {
 
   info "Configurando MinIO bucket..."
   docker exec minio sh -c \
-    "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb local/flight-data 2>/dev/null || true" 2>/dev/null
+    "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && (mc mb -p local/flight-data 2>/dev/null || mc stat local/flight-data >/dev/null)" \
+    || { err "Error configurando bucket MinIO flight-data"; return 1; }
 
   info "Creando keyspace y tablas en Cassandra..."
   docker exec cassandra cqlsh -e "
@@ -799,6 +823,12 @@ PY
   grep -q "State of driver .* is FINISHED" /tmp/practica_trainmodel.log ||
     { err "Spark no confirmo que TrainModel finalizara"; return 1; }
   ok "Modelo entrenado"
+  local model_count
+  model_count="$(docker exec minio sh -c \
+    "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc ls local/flight-data/models/" 2>/dev/null | wc -l)"
+  [ "${model_count:-0}" -ge 7 ] ||
+    { err "MinIO contiene ${model_count:-0} componentes de modelo; esperado al menos 7"; return 1; }
+  ok "Modelos verificados en MinIO: $model_count componentes"
 
   info "Arrancando Spark predictor en modo cluster..."
   docker compose --profile predictor up -d spark-predictor || return 1
