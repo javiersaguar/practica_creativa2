@@ -1,6 +1,6 @@
 from airflow import DAG
 from airflow.operators.bash import BashOperator
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 default_args = {"owner": "practica", "retries": 0}
 
@@ -198,8 +198,7 @@ echo "=== Training finished ==="
 with DAG(
     "retrain_flight_delay_model",
     default_args=default_args,
-    schedule_interval="@weekly",
-    start_date=datetime(2026, 1, 1),
+    schedule_interval=None,
     catchup=False,
     tags=["practica", "spark", "mlflow"],
 ) as dag:

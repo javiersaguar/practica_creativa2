@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
-# Prepara una VM Ubuntu 22.04 de Google Cloud para ejecutar practica.sh.
+# Prepara una VM Debian 12 o Ubuntu 22.04 de Google Cloud para ejecutar practica.sh.
 # No despliega servicios ni modifica la logica de la practica.
 
 set -u
+set -o pipefail
 
 PROJECT_HOME="${PROJECT_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 ZONE="${ZONE:-europe-southwest1-a}"
@@ -45,8 +46,11 @@ err() {
 }
 
 pause() {
+  if [ ! -t 0 ]; then
+    return 0
+  fi
   echo ""
-  read -r -p "  Pulsa ENTER para continuar..." _
+  read -r -p "  Pulsa ENTER para continuar..." _ || true
 }
 
 run_root() {
@@ -90,14 +94,23 @@ install_docker() {
     install_base_packages || return 1
     run_root install -m 0755 -d /etc/apt/keyrings || return 1
 
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.asc || return 1
+    . /etc/os-release
+    local docker_distro
+    case "${ID:-}" in
+      debian|ubuntu) docker_distro="$ID" ;;
+      *)
+        err "Sistema operativo no soportado para instalacion automatica de Docker: ${PRETTY_NAME:-${ID:-desconocido}}"
+        return 1
+        ;;
+    esac
+
+    curl -fsSL "https://download.docker.com/linux/$docker_distro/gpg" -o /tmp/docker.asc || return 1
     run_root install -m 0644 /tmp/docker.asc /etc/apt/keyrings/docker.asc || return 1
 
-    . /etc/os-release
     local arch
     arch="$(dpkg --print-architecture)"
-    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
-      "$arch" "$VERSION_CODENAME" > /tmp/docker.list
+    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
+      "$arch" "$docker_distro" "$VERSION_CODENAME" > /tmp/docker.list
     run_root install -m 0644 /tmp/docker.list /etc/apt/sources.list.d/docker.list || return 1
 
     APT_UPDATED=0
@@ -134,7 +147,7 @@ install_java() {
 install_gcloud() {
   header "INSTALACION -- GCLOUD CLI"
 
-  if command -v gcloud >/dev/null 2>&1; then
+  if command -v gcloud >/dev/null 2>&1 && gcloud version >/dev/null 2>&1; then
     ok "gcloud CLI ya esta instalado: $(command -v gcloud)"
     return 0
   fi
@@ -237,6 +250,17 @@ install_python_dependencies() {
   info "Activa el entorno cuando sea necesario: source .venv/bin/activate"
 }
 
+ensure_repo_data() {
+  header "VERIFICACION -- DATOS DEL REPOSITORIO"
+
+  info "Verificando presencia e integridad de los datos"
+  bash "$PROJECT_HOME/resources/download_data.sh" || return 1
+  [ -s "$PROJECT_HOME/data/origin_dest_distances.jsonl" ] &&
+    [ -s "$PROJECT_HOME/data/simple_flight_delay_features.jsonl.bz2" ] ||
+    { err "Los datos siguen ausentes tras la descarga"; return 1; }
+  ok "Datos descargados y verificados"
+}
+
 configure_gcloud() {
   header "CONFIGURACION -- AUTENTICACION GCLOUD"
 
@@ -244,16 +268,24 @@ configure_gcloud() {
 
   local active_account current_project selected_project current_zone selected_zone
   active_account="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -1)"
-  if [ -z "$active_account" ] || [[ "$active_account" == *developer.gserviceaccount.com ]]; then
-    warn "No hay una cuenta de usuario activa. Iniciando autenticacion interactiva."
+  if [ -z "$active_account" ]; then
+    if [ ! -t 0 ]; then
+      err "No hay cuenta gcloud activa. Ejecuta primero: gcloud auth login --no-launch-browser"
+      return 1
+    fi
+    warn "No hay una cuenta activa. Iniciando autenticacion interactiva."
     gcloud auth login --no-launch-browser || return 1
     active_account="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -1)"
   fi
   ok "Cuenta activa: $active_account"
 
   current_project="$(gcloud config get-value project 2>/dev/null || true)"
-  read -r -p "  Project ID [${current_project:-sin configurar}]: " selected_project
-  selected_project="${selected_project:-$current_project}"
+  if [ -t 0 ]; then
+    read -r -p "  Project ID [${PROJECT_ID:-${current_project:-sin configurar}}]: " selected_project || return 1
+  else
+    selected_project=""
+  fi
+  selected_project="${selected_project:-${PROJECT_ID:-$current_project}}"
   if [ -z "$selected_project" ]; then
     err "Debes indicar un Project ID"
     return 1
@@ -261,7 +293,11 @@ configure_gcloud() {
   gcloud config set project "$selected_project" >/dev/null || return 1
 
   current_zone="$(gcloud config get-value compute/zone 2>/dev/null || true)"
-  read -r -p "  Zona del cluster GKE [${current_zone:-$ZONE}]: " selected_zone
+  if [ -t 0 ]; then
+    read -r -p "  Zona del cluster GKE [${current_zone:-$ZONE}]: " selected_zone || return 1
+  else
+    selected_zone=""
+  fi
   selected_zone="${selected_zone:-${current_zone:-$ZONE}}"
   gcloud config set compute/zone "$selected_zone" >/dev/null || return 1
 
@@ -292,8 +328,8 @@ verify_installation() {
     failures=$((failures + 1))
   fi
 
-  if command -v gcloud >/dev/null 2>&1; then
-    ok "gcloud: $(gcloud version 2>/dev/null | head -1)"
+  if command -v gcloud >/dev/null 2>&1 && gcloud version >/dev/null 2>&1; then
+    ok "gcloud: $(gcloud version | head -1)"
   else
     err "gcloud no disponible"
     failures=$((failures + 1))
@@ -323,9 +359,14 @@ verify_installation() {
   local required
   for required in \
     docker/spark/Dockerfile \
+    docker/spark/download_jars.sh \
+    docker/spark/iceberg-spark-runtime.jar \
+    docker/spark/flight_prediction_2.13-0.1.jar \
     docker/kafka/Dockerfile \
+    docker/kafka/start-kafka.sh \
     data/origin_dest_distances.jsonl \
     data/simple_flight_delay_features.jsonl.bz2 \
+    resources/download_data.sh \
     shared-jars/flight_prediction_2.13-0.1.jar; do
     if [ -f "$PROJECT_HOME/$required" ]; then
       ok "Recurso del repositorio presente: $required"
@@ -334,6 +375,12 @@ verify_installation() {
       failures=$((failures + 1))
     fi
   done
+  if ! cmp -s \
+      "$PROJECT_HOME/shared-jars/flight_prediction_2.13-0.1.jar" \
+      "$PROJECT_HOME/docker/spark/flight_prediction_2.13-0.1.jar"; then
+    err "Las copias del JAR flight_prediction en shared-jars/ y docker/spark/ no coinciden"
+    failures=$((failures + 1))
+  fi
 
   if command -v docker >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
     warn "Docker esta instalado, pero la sesion actual no puede usar el daemon. Vuelve a entrar por SSH."
@@ -356,7 +403,7 @@ install_all() {
     install_kubectl \
     install_gke_auth_plugin \
     install_python_dependencies \
-    configure_gcloud \
+    ensure_repo_data \
     verify_installation; do
     "$step" || {
       err "Fallo el paso $step"
@@ -365,9 +412,34 @@ install_all() {
   done
 }
 
+run_cli() {
+  case "${1:-}" in
+    --all) install_all ;;
+    --configure-gcloud) configure_gcloud ;;
+    --verify) verify_installation ;;
+    --docker) install_docker ;;
+    --help|-h)
+      cat <<'EOF'
+Uso:
+  ./install.sh --all               Instala/verifica herramientas y datos sin autenticacion interactiva
+  ./install.sh --configure-gcloud  Configura cuenta, proyecto, zona y APIs de Google Cloud
+  ./install.sh --verify            Verifica herramientas y recursos
+  ./install.sh --docker            Instala/verifica Docker
+  ./install.sh                     Abre el menu interactivo
+EOF
+      ;;
+    *) err "Argumento no reconocido: ${1:-}"; return 2 ;;
+  esac
+}
+
+if [ "$#" -gt 0 ]; then
+  run_cli "$@"
+  exit $?
+fi
+
 while true; do
   header "INSTALACION VM -- PRACTICA BIGDATA"
-  echo -e "  ${GREEN}0)${NC} Instalar TODO automaticamente"
+  echo -e "  ${GREEN}0)${NC} Instalar/verificar herramientas y datos"
   echo ""
   echo -e "  ${GREEN}1)${NC} Docker Engine + Docker Compose plugin"
   echo -e "  ${GREEN}2)${NC} Java 17"
@@ -381,7 +453,11 @@ while true; do
   echo -e "  ${GREEN}9)${NC} Salir"
   echo -e "${BOLD}${BLUE}============================================${NC}"
   echo ""
-  read -r -p "  Selecciona una opcion: " option
+  if ! read -r -p "  Selecciona una opcion: " option; then
+    echo ""
+    info "Entrada cerrada; instalacion finalizada"
+    break
+  fi
 
   case "$option" in
     0) install_all; pause ;;

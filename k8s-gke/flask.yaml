@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
       - name: flask
-        image: europe-southwest1-docker.pkg.dev/project-6577bf93-e3eb-42be-8f6/practica/flask:latest
+        image: PRACTICA_REGISTRY/flask:PRACTICA_TAG
         imagePullPolicy: Always
         ports:
         - containerPort: 5001

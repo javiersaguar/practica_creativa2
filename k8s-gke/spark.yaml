@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
       - name: spark-master
-        image: europe-southwest1-docker.pkg.dev/project-6577bf93-e3eb-42be-8f6/practica/spark-master:latest
+        image: PRACTICA_REGISTRY/spark-master:PRACTICA_TAG
         imagePullPolicy: Always
         command: ["/opt/spark/bin/spark-class"]
         args: ["org.apache.spark.deploy.master.Master", "--host", "0.0.0.0"]
@@ -94,13 +94,24 @@ spec:
       labels:
         app: spark-worker
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["spark-worker"]
+              topologyKey: kubernetes.io/hostname
       tolerations:
       - key: "node.kubernetes.io/memory-pressure"
         operator: "Exists"
         effect: "NoSchedule"
       containers:
       - name: spark-worker
-        image: europe-southwest1-docker.pkg.dev/project-6577bf93-e3eb-42be-8f6/practica/spark-worker:latest
+        image: PRACTICA_REGISTRY/spark-worker:PRACTICA_TAG
         imagePullPolicy: Always
         command: ["/opt/spark/bin/spark-class"]
         args: ["org.apache.spark.deploy.worker.Worker", "--host", "$(MY_POD_IP)", "spark://spark-master:7077"]

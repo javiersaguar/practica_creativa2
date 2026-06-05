@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
       - name: spark-predictor
-        image: europe-southwest1-docker.pkg.dev/project-6577bf93-e3eb-42be-8f6/practica/spark-predictor:latest
+        image: PRACTICA_REGISTRY/spark-predictor:PRACTICA_TAG
         imagePullPolicy: Always
         command: ["/opt/spark/bin/spark-submit"]
         ports:

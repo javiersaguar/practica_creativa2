@@ -47,27 +47,25 @@ spec:
       labels:
         app: airflow
     spec:
+      securityContext:
+        fsGroup: 0
+        fsGroupChangePolicy: OnRootMismatch
       initContainers:
-      - name: kubectl-install
-        image: bitnami/kubectl:latest
-        imagePullPolicy: IfNotPresent
-        command: ["sh", "-c", "cp /opt/bitnami/kubectl/bin/kubectl /kubectl-bin/kubectl && chmod +x /kubectl-bin/kubectl"]
-        volumeMounts:
-        - name: kubectl-bin
-          mountPath: /kubectl-bin
       - name: airflow-init
-        image: apache/airflow:2.10.4
+        image: PRACTICA_REGISTRY/airflow:PRACTICA_TAG
         imagePullPolicy: Always
-        command: ["bash", "-c", "airflow db migrate && airflow users create --username admin --password admin --firstname Admin --lastname Admin --role Admin --email admin@example.com"]
+        command: ["bash", "-c", "airflow db migrate && (airflow users create --username admin --password admin --firstname Admin --lastname Admin --role Admin --email admin@example.com 2>/dev/null || true)"]
         env:
         - name: AIRFLOW__CORE__LOAD_EXAMPLES
+          value: "false"
+        - name: AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION
           value: "false"
         - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
           value: "sqlite:////opt/airflow/airflow.db"
         - name: IN_K8S
           value: "true"
         - name: KUBECTL
-          value: "/opt/kubectl-bin/kubectl"
+          value: "/usr/local/bin/kubectl"
         volumeMounts:
         - name: airflow-db
           mountPath: /opt/airflow
@@ -76,33 +74,39 @@ spec:
           subPath: retrain_model.py
       containers:
       - name: airflow
-        image: apache/airflow:2.10.4
+        image: PRACTICA_REGISTRY/airflow:PRACTICA_TAG
         imagePullPolicy: Always
-        command: ["bash", "-c", "airflow scheduler & airflow webserver"]
+        command: ["bash", "-c", "rm -f /opt/airflow/airflow-webserver.pid && airflow webserver --workers 1 & exec airflow scheduler"]
         ports:
         - containerPort: 8080
         env:
         - name: AIRFLOW__CORE__LOAD_EXAMPLES
+          value: "false"
+        - name: AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION
           value: "false"
         - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
           value: "sqlite:////opt/airflow/airflow.db"
         - name: IN_K8S
           value: "true"
         - name: KUBECTL
-          value: "/opt/kubectl-bin/kubectl"
+          value: "/usr/local/bin/kubectl"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 12
         volumeMounts:
         - name: airflow-db
           mountPath: /opt/airflow
         - name: dags
           mountPath: /opt/airflow/dags/retrain_model.py
           subPath: retrain_model.py
-        - name: kubectl-bin
-          mountPath: /opt/kubectl-bin
       serviceAccountName: airflow-sa
       volumes:
       - name: airflow-db
-        emptyDir: {}
-      - name: kubectl-bin
         emptyDir: {}
       - name: dags
         configMap:

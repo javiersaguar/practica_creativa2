@@ -29,7 +29,7 @@ spec:
           claimName: minio-pvc
       containers:
       - name: minio
-        image: minio/minio
+        image: minio/minio:RELEASE.2025-09-07T16-13-09Z
         imagePullPolicy: Always
         args: ["server", "/data", "--console-address", ":9001"]
         ports:
@@ -40,6 +40,14 @@ spec:
           value: "minioadmin"
         - name: MINIO_ROOT_PASSWORD
           value: "minioadmin"
+        readinessProbe:
+          httpGet:
+            path: /minio/health/ready
+            port: 9000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 24
         volumeMounts:
         - name: minio-data
           mountPath: /data

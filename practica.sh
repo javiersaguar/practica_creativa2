@@ -4,11 +4,16 @@
 #   ETSIT UPM 2026
 # ============================================================
 
-ZONE="europe-southwest1-a"
-CLUSTER="practica-k8s"
+set -o pipefail
+
+ZONE="${ZONE:-europe-southwest1-a}"
+CLUSTER="${CLUSTER:-practica-k8s}"
 PROJECT_HOME="${PROJECT_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 MANIFESTS="${MANIFESTS:-$PROJECT_HOME/k8s-gke}"
 SPARK_HOME=~/spark-4.1.1
+PRACTICA_NONINTERACTIVE="${PRACTICA_NONINTERACTIVE:-0}"
+PRACTICA_ASSUME_YES="${PRACTICA_ASSUME_YES:-0}"
+IMAGE_TAG="${IMAGE_TAG:-$(git -C "$PROJECT_HOME" rev-parse --short=12 HEAD 2>/dev/null || echo latest)}"
 export PROJECT_HOME
 
 # PATH para spark-submit
@@ -51,9 +56,519 @@ pass_check() { echo -e "  ${GREEN}✓${NC} $1"; }
 fail_check() { echo -e "  ${RED}✗${NC} $1"; }
 
 pause() {
+  if [ "$PRACTICA_NONINTERACTIVE" = "1" ] || [ ! -t 0 ]; then
+    return 0
+  fi
   echo ""
   echo -n "  Pulsa ENTER para continuar..."
-  read
+  read || true
+}
+
+wait_until() {
+  local timeout_seconds="$1" interval="$2" description="$3"
+  shift 3
+  local deadline=$((SECONDS + timeout_seconds))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if "$@" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$interval"
+  done
+  err "Timeout esperando: $description"
+  return 1
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || {
+    err "Docker no esta instalado. Ejecuta ./install.sh --all"
+    return 1
+  }
+  docker info >/dev/null 2>&1 || {
+    err "La sesion actual no puede usar Docker sin sudo."
+    echo "  Cierra y vuelve a abrir SSH, o ejecuta: newgrp docker"
+    return 1
+  }
+  docker compose version >/dev/null 2>&1 || {
+    err "Docker Compose plugin no esta disponible"
+    return 1
+  }
+}
+
+require_gcloud() {
+  command -v gcloud >/dev/null 2>&1 || {
+    err "gcloud no esta instalado. Ejecuta ./install.sh --all"
+    return 1
+  }
+  gcloud version >/dev/null 2>&1 || {
+    err "gcloud esta instalado, pero no funciona en esta sesion"
+    return 1
+  }
+}
+
+ensure_repo_resources() {
+  local required
+  bash "$PROJECT_HOME/resources/download_data.sh" || return 1
+
+  for required in \
+    data/origin_dest_distances.jsonl \
+    data/simple_flight_delay_features.jsonl.bz2 \
+    docker/spark/Dockerfile \
+    docker/spark/download_jars.sh \
+    docker/spark/iceberg-spark-runtime.jar \
+    docker/spark/flight_prediction_2.13-0.1.jar \
+    docker/kafka/Dockerfile \
+    docker/kafka/start-kafka.sh \
+    shared-jars/flight_prediction_2.13-0.1.jar; do
+    if [ ! -s "$PROJECT_HOME/$required" ]; then
+      err "Recurso obligatorio ausente: $required"
+      return 1
+    fi
+  done
+  cmp -s \
+    "$PROJECT_HOME/shared-jars/flight_prediction_2.13-0.1.jar" \
+    "$PROJECT_HOME/docker/spark/flight_prediction_2.13-0.1.jar" ||
+    { err "Las dos copias del JAR flight_prediction no coinciden"; return 1; }
+}
+
+wait_for_airflow() {
+  if wait_until 180 5 "base de datos Airflow" docker exec airflow airflow db check &&
+     wait_until 180 5 "webserver Airflow" curl -fsS http://localhost:8081/health; then
+    return 0
+  fi
+  warn "Airflow no quedo listo; reiniciando una vez"
+  docker compose restart airflow >/dev/null || return 1
+  wait_until 180 5 "base de datos Airflow tras restart" docker exec airflow airflow db check &&
+    wait_until 180 5 "webserver Airflow tras restart" curl -fsS http://localhost:8081/health
+}
+
+active_predictor_driver_id() {
+  curl -fsS http://localhost:8080/json/ 2>/dev/null | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+drivers = [
+    d for d in data.get("activedrivers", [])
+    if "MakePrediction" in d.get("mainclass", "")
+    and d.get("state") == "RUNNING"
+    and d.get("worker")
+]
+print(drivers[0].get("id", "") if drivers else "")
+' 2>/dev/null
+}
+
+predictor_streams_ready() {
+  local driver_id worker count
+  driver_id="$(active_predictor_driver_id)"
+  [ -n "$driver_id" ] || return 1
+  for worker in spark-worker-1 spark-worker-2; do
+    count="$(docker exec "$worker" sh -c "grep -c 'Stream started from' /opt/spark/work/$driver_id/stderr 2>/dev/null || true" 2>/dev/null | tail -1)"
+    [ "${count:-0}" -ge 4 ] 2>/dev/null && return 0
+  done
+  return 1
+}
+
+kill_predictor_drivers_docker() {
+  docker exec -i spark-master python3 - <<'PY' >/dev/null 2>&1
+import json
+import urllib.request
+
+try:
+    with urllib.request.urlopen("http://spark-master:8080/json/", timeout=10) as response:
+        drivers = json.load(response).get("activedrivers", [])
+except Exception:
+    raise SystemExit(0)
+
+for driver in drivers:
+    if "MakePrediction" not in driver.get("mainclass", ""):
+        continue
+    request = urllib.request.Request(
+        "http://spark-master:6066/v1/submissions/kill/" + driver["id"],
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=10).read()
+    except Exception:
+        pass
+PY
+  local deadline=$((SECONDS + 90))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    [ -z "$(active_predictor_driver_id)" ] && return 0
+    sleep 3
+  done
+  return 1
+}
+
+kill_practica_drivers_docker() {
+  docker exec -i spark-master python3 - <<'PY' >/dev/null 2>&1
+import json
+import urllib.request
+
+try:
+    with urllib.request.urlopen("http://spark-master:8080/json/", timeout=10) as response:
+        drivers = json.load(response).get("activedrivers", [])
+except Exception:
+    raise SystemExit(0)
+
+for driver in drivers:
+    if not any(name in driver.get("mainclass", "") for name in ("MakePrediction", "TrainModel")):
+        continue
+    request = urllib.request.Request(
+        "http://spark-master:6066/v1/submissions/kill/" + driver["id"],
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=10).read()
+    except Exception:
+        pass
+PY
+  local deadline=$((SECONDS + 120))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if curl -fsS http://localhost:8080/json/ 2>/dev/null | python3 -c '
+import json, sys
+drivers = json.load(sys.stdin).get("activedrivers", [])
+raise SystemExit(1 if any(any(name in d.get("mainclass", "") for name in ("MakePrediction", "TrainModel")) for d in drivers) else 0)
+' 2>/dev/null; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+run_e2e_docker_check() {
+  local uuid result status
+  uuid="$(curl -fsS -X POST http://localhost:5001/flights/delays/predict/classify_realtime \
+    -d "DepDelay=15&Carrier=AA&FlightDate=2016-12-25&Origin=ATL&Dest=SFO&FlightNum=1234" |
+    python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)"
+  [ -n "$uuid" ] || return 1
+  for _ in $(seq 1 40); do
+    result="$(curl -fsS "http://localhost:5001/flights/delays/predict/classify_realtime/response/$uuid" 2>/dev/null || true)"
+    status="$(printf "%s" "$result" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("status",""))' 2>/dev/null)"
+    if [ "$status" = "OK" ]; then
+      echo "$result"
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+render_k8s_manifests() {
+  local registry="$1" tag="$2" source target
+  RENDERED_MANIFESTS="$(mktemp -d /tmp/practica-k8s-rendered.XXXXXX)" || return 1
+  for source in "$MANIFESTS"/*.yaml; do
+    target="$RENDERED_MANIFESTS/$(basename "$source")"
+    sed \
+      -e "s#PRACTICA_REGISTRY#$registry#g" \
+      -e "s#PRACTICA_TAG#$tag#g" \
+      "$source" > "$target" || return 1
+  done
+  if grep -R "PRACTICA_REGISTRY\|PRACTICA_TAG" "$RENDERED_MANIFESTS" >/dev/null 2>&1; then
+    err "Quedaron placeholders sin renderizar en los manifests K8s"
+    return 1
+  fi
+  export RENDERED_MANIFESTS
+}
+
+configure_gke_nodeport_firewall() {
+  local project_id="$1"
+  local rule="${K8S_FIREWALL_RULE:-practica-k8s-nodeports}"
+  local source_ranges="${K8S_FIREWALL_SOURCE_RANGES:-0.0.0.0/0}"
+  local ports="tcp:30001,tcp:30300,tcp:30502,tcp:30808,tcp:30880,tcp:30901,tcp:30909"
+  local node_name tags node_tag="" network vm_public_ip vm_internal_ip vm_ip
+
+  if [ "$source_ranges" != "0.0.0.0/0" ]; then
+    vm_public_ip="$(curl -fsS --max-time 5 \
+      -H 'Metadata-Flavor: Google' \
+      http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip \
+      2>/dev/null || curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || true)"
+    vm_internal_ip="$(curl -fsS --max-time 5 \
+      -H 'Metadata-Flavor: Google' \
+      http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip \
+      2>/dev/null || true)"
+    for vm_ip in "$vm_public_ip" "$vm_internal_ip"; do
+      if [[ "$vm_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+         [[ ",$source_ranges," != *",$vm_ip/32,"* ]]; then
+        source_ranges="$source_ranges,$vm_ip/32"
+        info "Anadida IP de la VM al firewall para validar NodePorts: $vm_ip/32"
+      fi
+    done
+  fi
+
+  for node_name in $(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
+    tags="$(gcloud compute instances describe "$node_name" \
+      --zone "$ZONE" --project "$project_id" --format='value(tags.items)' 2>/dev/null || true)"
+    node_tag="$(printf '%s\n' "$tags" | tr ';, ' '\n' |
+      awk -v prefix="gke-${CLUSTER}-" 'index($0, prefix) == 1 && $0 ~ /-node$/ { print; exit }')"
+    [ -n "$node_tag" ] && break
+  done
+
+  if [ -z "$node_tag" ]; then
+    err "No se pudo detectar el target tag real de los nodos GKE"
+    echo "  Diagnostica cada nodo con:"
+    echo "  gcloud compute instances describe NODO --zone $ZONE --project $project_id --format='value(tags.items)'"
+    return 1
+  fi
+
+  network="$(gcloud container clusters describe "$CLUSTER" \
+    --zone "$ZONE" --project "$project_id" --format='value(network)' 2>/dev/null || true)"
+  network="${network##*/}"
+  [ -n "$network" ] || { err "No se pudo detectar la red del cluster GKE"; return 1; }
+
+  info "Configurando firewall NodePort con target tag real: $node_tag"
+  if gcloud compute firewall-rules describe "$rule" --project="$project_id" >/dev/null 2>&1; then
+    gcloud compute firewall-rules update "$rule" \
+      --allow="$ports" \
+      --source-ranges="$source_ranges" \
+      --target-tags="$node_tag" \
+      --project="$project_id" --quiet >/dev/null || {
+        err "No se pudo actualizar la regla $rule"
+        return 1
+      }
+  else
+    gcloud compute firewall-rules create "$rule" \
+      --network="$network" \
+      --direction=INGRESS \
+      --allow="$ports" \
+      --source-ranges="$source_ranges" \
+      --target-tags="$node_tag" \
+      --project="$project_id" --quiet >/dev/null || {
+        err "No se pudo crear la regla $rule"
+        return 1
+      }
+  fi
+  ok "Firewall NodePort listo: $rule ($source_ranges -> $node_tag)"
+}
+
+verify_k8s_nodeports() {
+  local node_ip name url check
+  node_ip="$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null)"
+  [ -n "$node_ip" ] || { err "Los nodos GKE no tienen IP externa para verificar NodePorts"; return 1; }
+
+  local checks=(
+    "Flask|http://$node_ip:30001/metrics"
+    "Spark UI|http://$node_ip:30880/json/"
+    "Grafana|http://$node_ip:30300/api/health"
+    "MLflow|http://$node_ip:30502/health"
+    "Airflow|http://$node_ip:30808/health"
+    "MinIO Console|http://$node_ip:30901/"
+    "Prometheus|http://$node_ip:30909/-/healthy"
+  )
+  for check in "${checks[@]}"; do
+    name="${check%%|*}"
+    url="${check#*|}"
+    wait_until 180 5 "NodePort $name ($url)" curl -fsS "$url" || return 1
+    ok "NodePort accesible: $name"
+  done
+}
+
+run_websocket_k8s_check() {
+  kubectl exec -i deployment/flask -- python3 - <<'PY'
+import threading
+import time
+import requests
+import socketio
+
+received = []
+prediction_id = {"value": None}
+event = threading.Event()
+sio = socketio.Client(reconnection=False, logger=False, engineio_logger=False)
+
+@sio.on("prediction_response")
+def on_prediction(data):
+    received.append(data)
+    event.set()
+
+sio.connect("http://localhost:5001", transports=["websocket"], wait_timeout=20)
+if sio.transport() != "websocket":
+    raise RuntimeError("Socket.IO no negocio transporte WebSocket")
+
+response = requests.post(
+    "http://localhost:5001/flights/delays/predict/classify_realtime",
+    data={
+        "DepDelay": "15",
+        "Carrier": "AA",
+        "FlightDate": "2016-12-25",
+        "Origin": "ATL",
+        "Dest": "SFO",
+        "FlightNum": "1234",
+    },
+    timeout=20,
+)
+response.raise_for_status()
+prediction_id["value"] = response.json()["id"]
+deadline = time.monotonic() + 90
+matched = None
+while time.monotonic() < deadline:
+    matched = next((item for item in received if item.get("UUID") == prediction_id["value"]), None)
+    if matched:
+        break
+    event.clear()
+    event.wait(min(3, max(0, deadline - time.monotonic())))
+if not matched:
+    raise RuntimeError("No se recibio prediction_response por WebSocket para el UUID solicitado")
+print("WebSocket prediction_response OK", prediction_id["value"], matched.get("Prediction"))
+sio.disconnect()
+PY
+}
+
+confirm_action() {
+  local prompt="$1" answer
+  if [ "$PRACTICA_ASSUME_YES" = "1" ]; then
+    return 0
+  fi
+  if [ "$PRACTICA_NONINTERACTIVE" = "1" ] || [ ! -t 0 ]; then
+    err "La operacion requiere confirmacion. Usa PRACTICA_ASSUME_YES=1."
+    return 1
+  fi
+  read -r -p "  $prompt (s/N): " answer || return 1
+  [[ "$answer" =~ ^[sS]$ ]]
+}
+
+latest_docker_dag_state() {
+  docker exec airflow airflow dags list-runs -d retrain_flight_delay_model -o json 2>/dev/null |
+    python3 -c '
+import json, sys
+runs = json.load(sys.stdin)
+runs.sort(key=lambda run: run.get("execution_date", ""), reverse=True)
+print(runs[0].get("state", "") if runs else "")
+' 2>/dev/null
+}
+
+wait_for_docker_dag_success() {
+  local deadline=$((SECONDS + 2700)) state
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    state="$(latest_docker_dag_state)"
+    case "$state" in
+      success) return 0 ;;
+      failed) err "El DAG de reentrenamiento termino en failed"; return 1 ;;
+      running|queued|"") info "DAG Airflow: ${state:-esperando registro}" ;;
+      *) info "DAG Airflow: $state" ;;
+    esac
+    sleep 10
+  done
+  err "Timeout esperando el DAG de reentrenamiento Docker"
+  return 1
+}
+
+k8s_predictor_streams_ready() {
+  local spark_pod driver_id worker_pod count
+  spark_pod="$(kubectl get pod -l app=spark-master --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+  [ -n "$spark_pod" ] || return 1
+  driver_id="$(kubectl exec "$spark_pod" -- python3 -c '
+import json, urllib.request
+data = json.load(urllib.request.urlopen("http://spark-master:8080/json/", timeout=5))
+drivers = [
+    d for d in data.get("activedrivers", [])
+    if "MakePrediction" in d.get("mainclass", "")
+    and d.get("state") == "RUNNING"
+    and d.get("worker")
+]
+print(drivers[0].get("id", "") if drivers else "")
+' 2>/dev/null)"
+  [ -n "$driver_id" ] || return 1
+  for worker_pod in $(kubectl get pod -l app=spark-worker --field-selector=status.phase=Running -o name 2>/dev/null); do
+    count="$(kubectl exec "$worker_pod" -- sh -c "grep -c 'Stream started from' /opt/spark/work/$driver_id/stderr 2>/dev/null || true" 2>/dev/null | tail -1)"
+    [ "${count:-0}" -ge 4 ] 2>/dev/null && return 0
+  done
+  return 1
+}
+
+k8s_trainmodel_completed_on_worker() {
+  kubectl exec deployment/spark-master -- python3 -c '
+import json
+import urllib.request
+d = json.load(urllib.request.urlopen("http://spark-master:8080/json/", timeout=10))
+drivers = [
+    x for x in d.get("completeddrivers", [])
+    if "TrainModel" in x.get("mainclass", "")
+    and x.get("state") == "FINISHED"
+    and x.get("worker")
+]
+assert drivers, "TrainModel no aparece FINISHED con worker asignado"
+print("TrainModel cluster:", drivers[0]["id"], drivers[0]["worker"])
+'
+}
+
+run_e2e_k8s_check() {
+  kubectl exec -i deployment/flask -- python3 - <<'PY'
+import json
+import sys
+import time
+import requests
+
+base = "http://localhost:5001/flights/delays/predict/classify_realtime"
+response = requests.post(base, data={
+    "DepDelay": "15",
+    "Carrier": "AA",
+    "FlightDate": "2016-12-25",
+    "Origin": "ATL",
+    "Dest": "SFO",
+    "FlightNum": "1234",
+}, timeout=15)
+response.raise_for_status()
+prediction_id = response.json()["id"]
+for _ in range(40):
+    result = requests.get(f"{base}/response/{prediction_id}", timeout=15).json()
+    if result.get("status") == "OK":
+        print(json.dumps(result, sort_keys=True))
+        raise SystemExit(0)
+    time.sleep(3)
+print("Timeout esperando prediccion", file=sys.stderr)
+raise SystemExit(1)
+PY
+}
+
+verify_k8s_prediction_sinks() {
+  local uuid="$1" mongo_count cassandra_hit kafka_hit
+  [ -n "$uuid" ] || { err "No se recibio UUID para verificar sinks K8s"; return 1; }
+
+  mongo_count="$(kubectl exec deployment/mongo -- mongosh --quiet agile_data_science \
+    --eval "db.flight_delay_ml_response.countDocuments({UUID: '$uuid'})" 2>/dev/null |
+    tail -1 | tr -d '[:space:]')"
+  [ "${mongo_count:-0}" -gt 0 ] 2>/dev/null ||
+    { err "MongoDB K8s no contiene el UUID $uuid"; return 1; }
+
+  cassandra_hit="$(kubectl exec deployment/cassandra -- cqlsh -e \
+    "SELECT uuid FROM agile_data_science.flight_delay_classification_response WHERE uuid='$uuid';" \
+    2>/dev/null | grep "$uuid" | head -1 || true)"
+  [ -n "$cassandra_hit" ] ||
+    { err "Cassandra K8s no contiene el UUID $uuid"; return 1; }
+
+  kafka_hit="$(kubectl exec deployment/kafka -- /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server localhost:9092 \
+    --topic flight-delay-ml-response \
+    --from-beginning --timeout-ms 10000 --max-messages 1000 2>/dev/null |
+    grep "$uuid" | tail -1 || true)"
+  [ -n "$kafka_hit" ] ||
+    { err "Kafka K8s no contiene el UUID $uuid en flight-delay-ml-response"; return 1; }
+
+  ok "Sinks K8s verificados para $uuid: Kafka, Cassandra y MongoDB"
+}
+
+latest_k8s_dag_state() {
+  local airflow_pod="$1"
+  kubectl exec "$airflow_pod" -- airflow dags list-runs -d retrain_flight_delay_model -o json 2>/dev/null |
+    python3 -c '
+import json, sys
+runs = json.load(sys.stdin)
+runs.sort(key=lambda run: run.get("execution_date", ""), reverse=True)
+print(runs[0].get("state", "") if runs else "")
+' 2>/dev/null
+}
+
+wait_for_k8s_dag_success() {
+  local airflow_pod="$1" deadline=$((SECONDS + 2700)) state
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    state="$(latest_k8s_dag_state "$airflow_pod")"
+    case "$state" in
+      success) return 0 ;;
+      failed) err "El DAG K8s termino en failed"; return 1 ;;
+      *) info "DAG Airflow K8s: ${state:-esperando registro}" ;;
+    esac
+    sleep 10
+  done
+  err "Timeout esperando el DAG K8s"
+  return 1
 }
 
 show_urls_docker() {
@@ -73,8 +588,11 @@ show_urls_docker() {
 }
 
 show_urls_k8s() {
+  command -v kubectl >/dev/null 2>&1 || { err "kubectl no esta disponible"; return 1; }
+  kubectl cluster-info >/dev/null 2>&1 || { err "No hay un cluster Kubernetes accesible"; return 1; }
   NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null)
   FLASK_IP=$(kubectl get service flask -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+  [ -n "$NODE_IP" ] || { err "El cluster no tiene una IP externa de nodo disponible"; return 1; }
   header "URLS KUBERNETES (GKE)"
   if [ -n "$FLASK_IP" ]; then
     echo -e "  ${BOLD}Flask (LoadBalancer):${NC}"
@@ -97,58 +615,58 @@ show_urls_k8s() {
 
 arrancar_docker() {
   header "ARRANCANDO STACK DOCKER COMPOSE"
-  cd $PROJECT_HOME
+  cd "$PROJECT_HOME" || return 1
+  require_docker || return 1
+  ensure_repo_resources || return 1
 
   info "Compilando JAR Scala si no existe o es antiguo..."
-  if [ ! -f "$PROJECT_HOME/shared-jars/flight_prediction_2.13-0.1.jar" ] ||      [ "$PROJECT_HOME/flight_prediction/src/main/scala/es/upm/dit/ging/predictor/MakePrediction.scala" -nt "$PROJECT_HOME/shared-jars/flight_prediction_2.13-0.1.jar" ] ||      [ "$PROJECT_HOME/flight_prediction/src/main/scala/es/upm/dit/ging/predictor/TrainModel.scala" -nt "$PROJECT_HOME/shared-jars/flight_prediction_2.13-0.1.jar" ]; then
+  if [ ! -f "$PROJECT_HOME/shared-jars/flight_prediction_2.13-0.1.jar" ] ||
+     [ "$PROJECT_HOME/flight_prediction/src/main/scala/es/upm/dit/ging/predictor/MakePrediction.scala" -nt "$PROJECT_HOME/shared-jars/flight_prediction_2.13-0.1.jar" ] ||
+     [ "$PROJECT_HOME/flight_prediction/src/main/scala/es/upm/dit/ging/predictor/TrainModel.scala" -nt "$PROJECT_HOME/shared-jars/flight_prediction_2.13-0.1.jar" ]; then
     info "Recompilando JAR con sbt..."
-    docker run --rm       -v "$PROJECT_HOME/flight_prediction":/app       -w /app       sbtscala/scala-sbt:eclipse-temurin-17.0.15_6_1.12.10_2.13.18       sbt assembly
-    mkdir -p "$PROJECT_HOME/shared-jars"
-    cp "$PROJECT_HOME/flight_prediction/target/scala-2.13/flight_prediction_2.13-0.1.jar"        "$PROJECT_HOME/shared-jars/flight_prediction_2.13-0.1.jar"
-    cp "$PROJECT_HOME/flight_prediction/target/scala-2.13/flight_prediction_2.13-0.1.jar"        "$PROJECT_HOME/docker/spark/flight_prediction_2.13-0.1.jar"
+    docker run --rm \
+      -v "$PROJECT_HOME/flight_prediction":/app \
+      -w /app \
+      sbtscala/scala-sbt:eclipse-temurin-17.0.15_6_1.12.10_2.13.18 \
+      sbt assembly || return 1
+    local built_jar="$PROJECT_HOME/flight_prediction/target/scala-2.13/flight_prediction_2.13-0.1.jar"
+    [ -s "$built_jar" ] || { err "sbt no genero $built_jar"; return 1; }
+    cp "$built_jar" "$PROJECT_HOME/shared-jars/flight_prediction_2.13-0.1.jar" || return 1
+    cp "$built_jar" "$PROJECT_HOME/docker/spark/flight_prediction_2.13-0.1.jar" || return 1
     ok "JAR compilado"
     info "Reconstruyendo imagenes Spark con nuevo JAR..."
-    docker compose build spark-master spark-worker-1 spark-worker-2 spark-predictor
+    docker compose build spark-master spark-worker-1 spark-worker-2 spark-predictor || return 1
     ok "Imagenes reconstruidas"
   else
     ok "JAR ya existe y esta actualizado"
   fi
 
   info "Levantando contenedores..."
-  docker compose up -d
-
-  info "Esperando inicializacion (30s)..."
-  sleep 30
+  docker compose up -d --build || { err "docker compose up --build fallo"; return 1; }
 
   info "Esperando a que Cassandra este lista..."
-  until docker exec cassandra cqlsh -e "describe keyspaces" > /dev/null 2>&1; do
-    echo "    Cassandra aun arrancando, esperando 10s..."
-    sleep 10
-  done
+  wait_until 300 5 "Cassandra" docker exec cassandra cqlsh -e "describe keyspaces" || return 1
   ok "Cassandra lista"
 
-  info "Spark predictor se creara cuando MinIO tenga los modelos..."
-
-  info "Reiniciando Flask..."
-  docker compose stop flask
-  docker compose start flask
-
-  info "Esperando inicializacion final (20s)..."
-  sleep 20
+  info "Esperando Kafka, MinIO, Spark, Flask y Airflow..."
+  wait_until 240 5 "Kafka" docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || return 1
+  wait_until 180 5 "MinIO" docker exec minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc ready local" || return 1
+  wait_until 180 5 "Spark UI" curl -fsS http://localhost:8080/json/ || return 1
+  wait_until 180 5 "Flask" curl -fsS http://localhost:5001/metrics || return 1
+  wait_for_airflow || return 1
+  ok "Servicios base listos"
 
   info "Configurando Airflow..."
   docker exec airflow airflow users create \
     --username admin --password admin \
     --firstname Admin --lastname Admin \
     --role Admin --email admin@example.com 2>/dev/null || true
+  docker exec airflow airflow dags unpause retrain_flight_delay_model >/dev/null 2>&1 ||
+    { err "No se pudo habilitar el DAG Airflow manual"; return 1; }
 
   info "Configurando MinIO bucket..."
   docker exec minio sh -c \
     "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb local/flight-data 2>/dev/null || true" 2>/dev/null
-
-  info "Asegurando JAR en shared-jars..."
-  mkdir -p "$PROJECT_HOME/shared-jars"
-  cp "$PROJECT_HOME/flight_prediction/target/scala-2.13/flight_prediction_2.13-0.1.jar"      "$PROJECT_HOME/shared-jars/flight_prediction_2.13-0.1.jar" 2>/dev/null     && ok "JAR copiado a shared-jars" || warn "JAR no encontrado en target"
 
   info "Creando keyspace y tablas en Cassandra..."
   docker exec cassandra cqlsh -e "
@@ -170,7 +688,8 @@ CREATE TABLE IF NOT EXISTS agile_data_science.flight_delay_classification_respon
   carrier TEXT,
   distance DOUBLE,
   route TEXT,
-  prediction DOUBLE);" 2>/dev/null && ok "Keyspace creado" || warn "Error Cassandra"
+  prediction DOUBLE);" 2>/dev/null || { err "Error creando tablas Cassandra"; return 1; }
+  ok "Keyspace creado"
 
   info "Importando distancias en Cassandra..."
   python3 -c "
@@ -182,17 +701,25 @@ with open('$PROJECT_HOME/data/origin_dest_distances.jsonl') as f:
         lines_cql.append(\"INSERT INTO agile_data_science.origin_dest_distances (origin, dest, distance) VALUES ('{}', '{}', {});\".format(r['Origin'], r['Dest'], float(r['Distance'])))
 with open('/tmp/distances.cql', 'w') as f:
     f.write(chr(10).join(lines_cql))
-" 2>/dev/null
-  docker cp /tmp/distances.cql cassandra:/tmp/distances.cql 2>/dev/null
-  docker exec cassandra cqlsh -f /tmp/distances.cql 2>/dev/null && ok "Distancias importadas" || warn "Error importando distancias"
-
-  info "Reiniciando workers para montar shared-jars..."
-  docker compose restart spark-master spark-worker-1 spark-worker-2
-  sleep 15
+" || { err "Error generando /tmp/distances.cql"; return 1; }
+  docker cp /tmp/distances.cql cassandra:/tmp/distances.cql >/dev/null || return 1
+  docker exec cassandra cqlsh -f /tmp/distances.cql >/dev/null 2>&1 || { err "Error importando distancias"; return 1; }
+  local distance_count
+  distance_count="$(docker exec cassandra cqlsh -e "SELECT COUNT(*) FROM agile_data_science.origin_dest_distances;" 2>/dev/null | awk '/^[[:space:]]*[0-9]+[[:space:]]*$/{gsub(/[[:space:]]/,""); print; exit}')"
+  [ "$distance_count" = "4696" ] || { err "Cassandra contiene ${distance_count:-0} distancias; esperado 4696"; return 1; }
+  ok "Distancias importadas: $distance_count"
 
   info "Subiendo datos de entrenamiento a MinIO..."
-  docker cp "$PROJECT_HOME/data/simple_flight_delay_features.jsonl.bz2" minio:/tmp/ 2>/dev/null
-  docker exec minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin && mc cp /tmp/simple_flight_delay_features.jsonl.bz2 local/flight-data/data/simple_flight_delay_features.jsonl.bz2 2>/dev/null"     && ok "Datos subidos a MinIO" || warn "Error subiendo datos"
+  docker cp "$PROJECT_HOME/data/simple_flight_delay_features.jsonl.bz2" minio:/tmp/ >/dev/null || return 1
+  docker exec minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc cp /tmp/simple_flight_delay_features.jsonl.bz2 local/flight-data/data/simple_flight_delay_features.jsonl.bz2 >/dev/null" \
+    || { err "Error subiendo datos"; return 1; }
+  ok "Datos subidos a MinIO"
+
+  info "Deteniendo predictor anterior y limpiando checkpoints..."
+  docker compose --profile predictor stop spark-predictor >/dev/null 2>&1 || true
+  kill_practica_drivers_docker || { err "No se pudieron detener los drivers Spark anteriores"; return 1; }
+  docker exec minio sh -c \
+    "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc rm --recursive --force local/flight-data/checkpoints/predictor >/dev/null 2>&1 || true"
 
   info "Creando tabla Iceberg (2-3 min)..."
   cat > /tmp/load_iceberg.py << 'PY'
@@ -216,11 +743,25 @@ df.writeTo("minio.flights.training_data").create()
 print("Registros Iceberg:", spark.table("minio.flights.training_data").count())
 spark.stop()
 PY
-  docker cp /tmp/load_iceberg.py spark-master:/tmp/load_iceberg.py
-  docker exec spark-master bash -lc "/opt/spark/bin/spark-submit --master spark://spark-master:7077 --packages org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.1,org.apache.hadoop:hadoop-aws:3.4.2,com.amazonaws:aws-java-sdk-bundle:1.12.367 --conf spark.jars.ivy=/home/spark/.ivy2 /tmp/load_iceberg.py" 2>&1 | grep -E "Registros|ERROR" | tail -3 && ok "Tabla Iceberg creada" || warn "Error Iceberg"
+  docker cp /tmp/load_iceberg.py spark-master:/tmp/load_iceberg.py >/dev/null || return 1
+  if ! timeout 900 docker exec spark-master /opt/spark/bin/spark-submit \
+    --master spark://spark-master:7077 \
+    --conf spark.executor.instances=1 \
+    --conf spark.executor.cores=1 \
+    --conf spark.executor.memory=1g \
+    --conf spark.cores.max=2 \
+    --conf spark.files.io.connectionTimeout=600s \
+    /tmp/load_iceberg.py 2>&1 | tee /tmp/practica_iceberg.log; then
+    err "Error creando tabla Iceberg"
+    tail -40 /tmp/practica_iceberg.log
+    return 1
+  fi
+  grep -q "Registros Iceberg: 457013" /tmp/practica_iceberg.log ||
+    { err "La tabla Iceberg no contiene los 457013 registros esperados"; return 1; }
+  ok "Tabla Iceberg creada: 457013 registros"
 
   info "Entrenando modelo TrainModel en deploy-mode cluster (3-4 min)..."
-  docker exec spark-master /opt/spark/bin/spark-submit \
+  if ! timeout 1800 docker exec spark-master /opt/spark/bin/spark-submit \
     --master spark://spark-master:7077 \
     --deploy-mode cluster \
     --class es.upm.dit.ging.predictor.TrainModel \
@@ -250,19 +791,35 @@ PY
     --conf spark.sql.catalog.minio=org.apache.iceberg.spark.SparkCatalog \
     --conf spark.sql.catalog.minio.type=hadoop \
     --conf spark.sql.catalog.minio.warehouse=s3a://flight-data/warehouse \
-    file:///shared-jars/flight_prediction_2.13-0.1.jar \
-    && ok "Modelo entrenado" || warn "Error entrenamiento (ver logs del worker)"
+    file:///shared-jars/flight_prediction_2.13-0.1.jar 2>&1 | tee /tmp/practica_trainmodel.log; then
+    err "Error entrenando el modelo"
+    tail -60 /tmp/practica_trainmodel.log
+    return 1
+  fi
+  grep -q "State of driver .* is FINISHED" /tmp/practica_trainmodel.log ||
+    { err "Spark no confirmo que TrainModel finalizara"; return 1; }
+  ok "Modelo entrenado"
 
   info "Arrancando Spark predictor en modo cluster..."
-  docker compose --profile predictor up -d spark-predictor
-  ok "Predictor enviado al cluster"
+  docker compose --profile predictor up -d spark-predictor || return 1
+  wait_until 300 5 "los cuatro streams del predictor Spark" predictor_streams_ready || {
+    for worker in spark-worker-1 spark-worker-2; do
+      docker exec "$worker" sh -c 'D=$(ls -td /opt/spark/work/driver-* 2>/dev/null | head -1); tail -80 "$D/stderr" 2>/dev/null' || true
+    done
+    return 1
+  }
+  ok "Predictor listo con cuatro streams activos"
 
-  info "Disparando DAG Airflow para reentrenamientos futuros..."
-  docker exec airflow airflow dags unpause retrain_flight_delay_model 2>/dev/null || true
+  info "DAG Airflow disponible para reentrenamiento manual"
+
+  info "Ejecutando prediccion end-to-end de validacion..."
+  local e2e_result
+  e2e_result="$(run_e2e_docker_check)" || { err "La prediccion end-to-end fallo"; return 1; }
+  ok "Prediccion end-to-end correcta"
+  echo "  $e2e_result"
 
   ok "Stack Docker listo"
   show_urls_docker
-  pause
 }
 
 # ============================================================
@@ -272,7 +829,9 @@ PY
 arrancar_k8s() {
   header "ARRANCANDO KUBERNETES GKE"
 
-  cd "$PROJECT_HOME"
+  cd "$PROJECT_HOME" || return 1
+  ensure_repo_resources || return 1
+  require_gcloud || return 1
   export USE_GKE_GCLOUD_AUTH_PLUGIN=True
   export PATH="/usr/local/bin:/tmp:$PATH"
 
@@ -321,23 +880,25 @@ SHIM
   fi
 
   ACTIVE_ACCOUNT=$(gcloud config get-value account 2>/dev/null || true)
-  USER_ACCOUNT=$(gcloud auth list --format='value(account)' 2>/dev/null | grep -v 'developer.gserviceaccount.com' | grep '@' | head -n 1 || true)
-  if [[ "$ACTIVE_ACCOUNT" == *developer.gserviceaccount.com ]] && [ -n "$USER_ACCOUNT" ]; then
-    info "Cambiando gcloud a cuenta de usuario: $USER_ACCOUNT"
-    gcloud config set account "$USER_ACCOUNT" >/dev/null
-    ACTIVE_ACCOUNT="$USER_ACCOUNT"
-  fi
-  if [[ "$ACTIVE_ACCOUNT" == *developer.gserviceaccount.com ]] || [ -z "$ACTIVE_ACCOUNT" ]; then
-    err "Solo hay credenciales de service account con scopes insuficientes"
-    echo "  En la consola GCloud abre:"
-    echo "  https://console.cloud.google.com/kubernetes/clusters/details/$ZONE/$CLUSTER/details?project=$PROJECT_ID"
-    echo "  Luego en esta VM ejecuta una sola vez:"
-    echo "  gcloud auth login --no-launch-browser"
-    echo "  gcloud config set account TU_USUARIO"
-    echo "  gcloud container clusters get-credentials $CLUSTER --zone $ZONE --project $PROJECT_ID"
+  [ -n "$ACTIVE_ACCOUNT" ] || {
+    err "gcloud no tiene una cuenta activa"
+    echo "  Ejecuta: gcloud auth login --no-launch-browser"
+    return 1
+  }
+  ok "gcloud activo: $ACTIVE_ACCOUNT / $PROJECT_ID"
+
+  if ! gcloud container clusters describe "$CLUSTER" --zone "$ZONE" --project "$PROJECT_ID" >/dev/null 2>&1; then
+    err "La cuenta activa no puede describir el cluster $CLUSTER en $ZONE, o el cluster no existe"
+    echo "  Verifica con: gcloud container clusters list --project=$PROJECT_ID"
+    echo "  Si recibes PERMISSION_DENIED: gcloud auth login --no-launch-browser"
+    echo "  Si no existe, crealo siguiendo la seccion GKE del README"
     return 1
   fi
-  ok "gcloud activo: $ACTIVE_ACCOUNT / $PROJECT_ID"
+  if ! gcloud compute firewall-rules list --limit=1 --project="$PROJECT_ID" >/dev/null 2>&1; then
+    err "La cuenta activa no puede consultar/administrar reglas de firewall en $PROJECT_ID"
+    echo "  Necesita roles/compute.viewer y roles/compute.securityAdmin, o una cuenta autorizada"
+    return 1
+  fi
 
   info "Autenticando con el cluster..."
   gcloud container clusters get-credentials "$CLUSTER" --zone "$ZONE" --project "$PROJECT_ID" || {
@@ -350,9 +911,7 @@ SHIM
   }
   ok "Cluster GKE accesible"
 
-  kubectl scale deployment/spark-predictor --replicas=0 2>/dev/null || true
-
-  TARGET_NODES="${K8S_NODE_COUNT:-2}"
+	  TARGET_NODES="${K8S_NODE_COUNT:-2}"
   NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | sed '/^$/d' | wc -l)
   if [ "$NODE_COUNT" -lt "$TARGET_NODES" ]; then
     info "Escalando cluster a $TARGET_NODES nodos..."
@@ -386,38 +945,57 @@ SHIM
       sleep 10
     done
   fi
-  kubectl wait --for=condition=Ready nodes --all --timeout=300s
+  kubectl wait --for=condition=Ready nodes --all --timeout=300s || return 1
   NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | sed '/^$/d' | wc -l)
   ok "Cluster con $NODE_COUNT nodos Ready"
+  configure_gke_nodeport_firewall "$PROJECT_ID" || return 1
 
   AR_LOCATION="${ZONE%-*}"
   REGISTRY="${AR_LOCATION}-docker.pkg.dev/${PROJECT_ID}/practica"
+  info "Verificando repositorio Artifact Registry..."
+  gcloud artifacts repositories describe practica --location="$AR_LOCATION" --project="$PROJECT_ID" >/dev/null 2>&1 ||
+    gcloud artifacts repositories create practica \
+      --project="$PROJECT_ID" \
+      --repository-format=docker \
+      --location="$AR_LOCATION" \
+      --description="Imagenes Docker de la practica Big Data" || {
+        err "No se pudo crear/verificar Artifact Registry practica"
+        return 1
+      }
+
+  require_docker || return 1
   if command -v docker >/dev/null 2>&1; then
     info "Publicando imagenes K8s en Artifact Registry..."
-    gcloud auth configure-docker "${AR_LOCATION}-docker.pkg.dev" --quiet >/dev/null
+    gcloud auth configure-docker "${AR_LOCATION}-docker.pkg.dev" --quiet >/dev/null || return 1
     docker build \
-      -t "$REGISTRY/spark-master:latest" \
-      -t "$REGISTRY/spark-worker:latest" \
-      -t "$REGISTRY/spark-predictor:latest" \
+      -t "$REGISTRY/spark-master:$IMAGE_TAG" \
+      -t "$REGISTRY/spark-worker:$IMAGE_TAG" \
+      -t "$REGISTRY/spark-predictor:$IMAGE_TAG" \
       "$PROJECT_HOME/docker/spark" \
-      && docker push "$REGISTRY/spark-master:latest" \
-      && docker push "$REGISTRY/spark-worker:latest" \
-      && docker push "$REGISTRY/spark-predictor:latest" \
+      && docker push "$REGISTRY/spark-master:$IMAGE_TAG" \
+      && docker push "$REGISTRY/spark-worker:$IMAGE_TAG" \
+      && docker push "$REGISTRY/spark-predictor:$IMAGE_TAG" \
       && ok "Imagenes Spark publicadas con el JAR actual" \
       || { err "Error publicando imagenes Spark"; return 1; }
 
-    docker build -t "$REGISTRY/kafka:latest" "$PROJECT_HOME/docker/kafka" \
-      && docker push "$REGISTRY/kafka:latest" \
+    docker build -t "$REGISTRY/kafka:$IMAGE_TAG" "$PROJECT_HOME/docker/kafka" \
+      && docker push "$REGISTRY/kafka:$IMAGE_TAG" \
       && ok "Imagen Kafka publicada" \
       || { err "Error publicando imagen Kafka"; return 1; }
 
-    docker build -f "$PROJECT_HOME/docker/flask/Dockerfile" -t "$REGISTRY/flask:latest" "$PROJECT_HOME" \
-      && docker push "$REGISTRY/flask:latest" \
+    docker build -f "$PROJECT_HOME/docker/flask/Dockerfile" -t "$REGISTRY/flask:$IMAGE_TAG" "$PROJECT_HOME" \
+      && docker push "$REGISTRY/flask:$IMAGE_TAG" \
       && ok "Imagen Flask publicada" \
       || { err "Error publicando imagen Flask"; return 1; }
-  else
-    warn "docker no esta disponible; se usaran las imagenes ya publicadas en $REGISTRY"
+
+    docker build -t "$REGISTRY/airflow:$IMAGE_TAG" "$PROJECT_HOME/docker/airflow" \
+      && docker push "$REGISTRY/airflow:$IMAGE_TAG" \
+      && ok "Imagen Airflow con kubectl publicada" \
+      || { err "Error publicando imagen Airflow"; return 1; }
   fi
+
+  render_k8s_manifests "$REGISTRY" "$IMAGE_TAG" || return 1
+  ok "Manifests renderizados para $REGISTRY con tag $IMAGE_TAG"
 
   info "Creando ConfigMap del DAG de Airflow..."
   kubectl create configmap airflow-dags \
@@ -427,39 +1005,53 @@ SHIM
 
   info "Aplicando manifests base..."
   for manifest in mongo cassandra minio kafka spark flask prometheus grafana mlflow airflow; do
-    kubectl apply -f "$MANIFESTS/$manifest.yaml" || return 1
+    kubectl apply -f "$RENDERED_MANIFESTS/$manifest.yaml" || return 1
   done
 
   info "Esperando deployments base..."
-  kubectl rollout status deployment/mongo --timeout=180s || true
-  kubectl rollout status deployment/minio --timeout=180s || true
-  kubectl rollout status deployment/kafka --timeout=240s || true
-  kubectl rollout status deployment/spark-master --timeout=240s || true
-  kubectl rollout status deployment/spark-worker --timeout=240s || true
-  kubectl rollout status deployment/mlflow --timeout=180s || true
-  kubectl rollout status deployment/flask --timeout=180s || true
-  kubectl rollout status deployment/airflow --timeout=240s || true
+  for deployment in mongo minio kafka spark-master spark-worker mlflow flask airflow prometheus grafana; do
+    kubectl rollout status "deployment/$deployment" --timeout=300s ||
+      { err "Deployment $deployment no quedo listo"; kubectl get pods -o wide; return 1; }
+  done
+  if [ "$NODE_COUNT" -ge 2 ]; then
+    SPARK_WORKER_NODE_COUNT="$(kubectl get pods -l app=spark-worker \
+      -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null |
+      sed '/^$/d' | sort -u | wc -l)"
+    [ "$SPARK_WORKER_NODE_COUNT" -ge 2 ] ||
+      { err "Los dos spark-worker no quedaron distribuidos entre nodos GKE"; kubectl get pods -l app=spark-worker -o wide; return 1; }
+    ok "Spark workers distribuidos entre $SPARK_WORKER_NODE_COUNT nodos GKE"
+  else
+    warn "Cluster con un solo nodo: deploy-mode cluster funciona, pero no demuestra distribucion entre nodos GKE"
+  fi
+
+  info "Deteniendo predictor existente antes del bootstrap de datos..."
+  kubectl scale deployment/spark-predictor --replicas=0 2>/dev/null || true
 
   info "Configurando MinIO y subiendo datos..."
-  kubectl wait --for=condition=Ready pod -l app=minio --timeout=180s
+  kubectl wait --for=condition=Ready pod -l app=minio --timeout=180s ||
+    { err "MinIO no quedo Ready"; return 1; }
   MINIO_POD=$(kubectl get pod -l app=minio -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
   kubectl exec "$MINIO_POD" -- sh -c \
     "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc mb -p local/flight-data 2>/dev/null || true"
   kubectl exec -i "$MINIO_POD" -- sh -c \
     "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc pipe local/flight-data/data/simple_flight_delay_features.jsonl.bz2" \
-    < "$PROJECT_HOME/data/simple_flight_delay_features.jsonl.bz2"
-  find "$PROJECT_HOME/models" -type f | while IFS= read -r f; do
-    REL="${f#$PROJECT_HOME/models/}"
-    kubectl exec -i "$MINIO_POD" -- sh -c \
-      "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc pipe \"local/flight-data/models/$REL\"" \
-      < "$f" >/dev/null 2>&1 || true
-  done
+    < "$PROJECT_HOME/data/simple_flight_delay_features.jsonl.bz2" ||
+    { err "No se pudieron cargar los datos de entrenamiento en MinIO"; return 1; }
+  if [ -d "$PROJECT_HOME/models" ]; then
+    find "$PROJECT_HOME/models" -type f | while IFS= read -r f; do
+      REL="${f#$PROJECT_HOME/models/}"
+      kubectl exec -i "$MINIO_POD" -- sh -c \
+        "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc pipe \"local/flight-data/models/$REL\"" \
+        < "$f" >/dev/null 2>&1 || true
+    done
+  fi
   kubectl exec "$MINIO_POD" -- sh -c \
     "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc rm --recursive --force local/flight-data/checkpoints/predictor 2>/dev/null || true"
   ok "MinIO listo con datos de entrenamiento"
 
   info "Esperando Cassandra lista..."
-  kubectl wait --for=condition=Ready pod -l app=cassandra --timeout=240s
+  kubectl wait --for=condition=Ready pod -l app=cassandra --timeout=240s ||
+    { err "Cassandra no quedo Ready"; return 1; }
   sleep 10
 
   info "Creando keyspace y tablas en Cassandra..."
@@ -502,6 +1094,12 @@ print(f'Generadas {len(lines)} sentencias')
 PYEOF
   kubectl exec -i deployment/cassandra -- cqlsh < /tmp/distances_k8s.cql \
     && ok "Distancias importadas" || { err "Error importando distancias"; return 1; }
+  K8S_DISTANCE_COUNT=$(kubectl exec deployment/cassandra -- cqlsh -e \
+    "SELECT COUNT(*) FROM agile_data_science.origin_dest_distances;" 2>/dev/null |
+    awk '/^[[:space:]]*[0-9]+[[:space:]]*$/ { gsub(/[[:space:]]/, ""); print; exit }')
+  [ "$K8S_DISTANCE_COUNT" = "4696" ] ||
+    { err "Cassandra K8s contiene ${K8S_DISTANCE_COUNT:-0} distancias; esperado 4696"; return 1; }
+  ok "Distancias verificadas: 4696"
 
   info "Verificando JAR en Spark..."
   kubectl wait --for=condition=Ready pod -l app=spark-master --timeout=180s
@@ -591,8 +1189,8 @@ JAVA
   for WORKER_POD in $(kubectl get pod -l app=spark-worker -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
     kubectl cp /tmp/load-iceberg-k8s.jar "$WORKER_POD":/tmp/load-iceberg-k8s.jar
   done
-  kubectl exec "$SPARK_POD" -- /opt/spark/bin/spark-submit \
-    --master spark://spark-master:7077 \
+	  if kubectl exec "$SPARK_POD" -- /opt/spark/bin/spark-submit \
+	    --master spark://spark-master:7077 \
     --deploy-mode cluster \
     --conf spark.standalone.submit.waitAppCompletion=true \
     --conf spark.driver.cores=1 \
@@ -614,8 +1212,26 @@ JAVA
     --conf spark.sql.catalog.minio.type=hadoop \
     --conf spark.sql.catalog.minio.warehouse=s3a://flight-data/warehouse \
     --class LoadIcebergK8s \
-    file:///tmp/load-iceberg-k8s.jar \
-    && ok "Tabla Iceberg creada" || { err "Error creando tabla Iceberg"; return 1; }
+    file:///tmp/load-iceberg-k8s.jar 2>&1 | tee /tmp/practica_k8s_iceberg.log; then
+    ICEBERG_DRIVER_ID="$(awk '/Driver successfully submitted as/ { print $NF }' /tmp/practica_k8s_iceberg.log | tail -1)"
+    ICEBERG_COUNT_LINE=""
+    if [ -n "$ICEBERG_DRIVER_ID" ]; then
+      for WORKER_POD in $(kubectl get pod -l app=spark-worker -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
+        ICEBERG_COUNT_LINE="$(kubectl exec "$WORKER_POD" -- bash -lc \
+          "grep -h 'Registros Iceberg:' '/opt/spark/work/$ICEBERG_DRIVER_ID/stdout' '/opt/spark/work/$ICEBERG_DRIVER_ID/stderr' 2>/dev/null | tail -1" 2>/dev/null || true)"
+        [ -n "$ICEBERG_COUNT_LINE" ] && break
+      done
+    fi
+    if [ -z "$ICEBERG_COUNT_LINE" ]; then
+      ICEBERG_COUNT_LINE="$(grep 'Registros Iceberg:' /tmp/practica_k8s_iceberg.log 2>/dev/null | tail -1 || true)"
+    fi
+    printf '%s\n' "$ICEBERG_COUNT_LINE" | grep -q "Registros Iceberg: 457013" ||
+      { err "La tabla Iceberg K8s no contiene los 457013 registros esperados"; return 1; }
+    ok "Tabla Iceberg K8s creada: 457013 registros"
+  else
+    err "Error creando tabla Iceberg"
+    return 1
+  fi
 
   info "Entrenando modelo TrainModel en K8s (deploy-mode cluster)..."
   kubectl exec "$SPARK_POD" -- bash -lc '
@@ -658,6 +1274,15 @@ AWS_SECRET_ACCESS_KEY=minioadmin \
   file:///app/jars/flight_prediction_2.13-0.1.jar
 ' \
     && ok "Modelo entrenado y registrado en MLflow" || { err "Error entrenando modelo"; return 1; }
+  k8s_trainmodel_completed_on_worker ||
+    { err "No se pudo demostrar TrainModel K8s en deploy-mode cluster"; return 1; }
+  ok "TrainModel K8s confirmado en worker"
+
+  K8S_MODEL_COUNT=$(kubectl exec "$MINIO_POD" -- sh -c \
+    "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc ls local/flight-data/models/" 2>/dev/null | wc -l)
+  [ "$K8S_MODEL_COUNT" -ge 7 ] ||
+    { err "MinIO K8s solo contiene ${K8S_MODEL_COUNT:-0} componentes de modelo; esperado al menos 7"; return 1; }
+  ok "Modelos verificados en MinIO K8s: $K8S_MODEL_COUNT componentes"
 
   info "Arrancando Spark predictor en K8s..."
   kubectl scale deployment/spark-predictor --replicas=0 2>/dev/null || true
@@ -696,10 +1321,10 @@ for _ in range(30):
 else:
     raise RuntimeError("Predictor drivers did not stop in time")
 PY
-  kubectl apply -f "$MANIFESTS/spark-predictor-patch.yaml"
-  kubectl scale deployment/spark-predictor --replicas=1
-  kubectl rollout status deployment/spark-predictor --timeout=240s || true
-  sleep 30
+  kubectl apply -f "$RENDERED_MANIFESTS/spark-predictor-patch.yaml" || return 1
+  kubectl scale deployment/spark-predictor --replicas=1 || return 1
+  kubectl rollout status deployment/spark-predictor --timeout=300s || return 1
+  wait_until 420 5 "los cuatro streams del predictor K8s" k8s_predictor_streams_ready || return 1
   PREDICTOR_POD=$(kubectl get pod -l app=spark-predictor --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
   if [ -z "$PREDICTOR_POD" ]; then
     err "spark-predictor no esta Running"
@@ -714,17 +1339,29 @@ PY
     ok "Predictor K8s arrancado correctamente"
   fi
 
-  info "Configurando Airflow (kubectl + DAG unpause)..."
+  info "Configurando Airflow (kubectl + DAG manual)..."
   AIRFLOW_POD=$(kubectl get pod -l app=airflow --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
   if [ -n "$AIRFLOW_POD" ]; then
-    KUBECTL_BIN=$(command -v kubectl)
-    kubectl cp "$KUBECTL_BIN" "$AIRFLOW_POD":/tmp/kubectl 2>/dev/null || true
-    kubectl exec "$AIRFLOW_POD" -- chmod +x /tmp/kubectl 2>/dev/null || true
+    kubectl exec "$AIRFLOW_POD" -- test -x /usr/local/bin/kubectl ||
+      { err "La imagen Airflow K8s no contiene kubectl"; return 1; }
     kubectl exec "$AIRFLOW_POD" -- airflow dags unpause retrain_flight_delay_model 2>/dev/null || true
     ok "Airflow configurado"
   else
-    warn "Airflow no esta Running; revisa kubectl get pods"
+    err "Airflow no esta Running"
+    return 1
   fi
+
+  info "Ejecutando prediccion end-to-end interna en K8s..."
+  run_e2e_k8s_check >/tmp/practica_k8s_e2e.json ||
+    { err "La prediccion end-to-end K8s fallo"; return 1; }
+  ok "Prediccion end-to-end K8s correcta"
+  K8S_E2E_UUID="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("id", ""))' \
+    < /tmp/practica_k8s_e2e.json 2>/dev/null)"
+  verify_k8s_prediction_sinks "$K8S_E2E_UUID" || return 1
+  run_websocket_k8s_check ||
+    { err "La prediccion K8s no llego por WebSocket real"; return 1; }
+  ok "WebSocket K8s real verificado"
+  verify_k8s_nodeports || return 1
 
   echo ""
   info "Estado de pods:"
@@ -733,7 +1370,6 @@ PY
 
   ok "Stack Kubernetes listo"
   show_urls_k8s
-  pause
 }
 
 # ============================================================
@@ -743,18 +1379,21 @@ PY
 reentrenar_docker() {
   header "REENTRENAMIENTO -- DOCKER"
   warn "El reentrenamiento en Docker ejecuta el DAG de Airflow"
+  cd "$PROJECT_HOME" || return 1
+  require_docker || return 1
+  wait_for_airflow || return 1
 
   info "Disparando DAG retrain_flight_delay_model en Airflow..."
-  docker exec airflow airflow dags unpause retrain_flight_delay_model 2>/dev/null || true
-  docker exec airflow airflow dags trigger retrain_flight_delay_model 2>/dev/null \
-    && ok "DAG disparado correctamente" \
-    || warn "Error disparando DAG -- comprueba Airflow UI"
+  docker exec airflow airflow dags trigger retrain_flight_delay_model >/dev/null 2>&1 ||
+    { err "Error disparando DAG"; return 1; }
+  ok "DAG disparado correctamente"
 
-  IP=$(curl -s ifconfig.me 2>/dev/null || echo "IP_DESCONOCIDA")
-  info "Sigue el progreso en: http://$IP:8081 -> DAGs -> retrain_flight_delay_model"
-  info "MLflow: http://$IP:5002 -> flight_delay_prediction"
-  info "El entrenamiento tarda ~4 minutos. Puedes monitorizar en la UI."
-  pause
+  info "Esperando finalizacion del DAG (max 45 min)..."
+  wait_for_docker_dag_success || return 1
+  wait_until 300 5 "predictor tras reentrenamiento" predictor_streams_ready || return 1
+  run_e2e_docker_check >/tmp/practica_retrain_e2e.json ||
+    { err "La validacion end-to-end tras reentrenar fallo"; return 1; }
+  ok "Reentrenamiento Docker y prediccion posterior correctos"
 }
 
 reentrenar_k8s() {
@@ -762,7 +1401,13 @@ reentrenar_k8s() {
   warn "El reentrenamiento en K8s ejecuta el DAG de Airflow"
 
   info "Verificando conexion al cluster..."
-  gcloud container clusters get-credentials $CLUSTER --zone $ZONE 2>/dev/null
+  require_gcloud || return 1
+  local project_id
+  project_id="$(gcloud config get-value project 2>/dev/null || true)"
+  [ -n "$project_id" ] || { err "gcloud no tiene proyecto configurado"; return 1; }
+  gcloud container clusters get-credentials "$CLUSTER" --zone "$ZONE" --project "$project_id" >/dev/null ||
+    return 1
+  kubectl cluster-info >/dev/null || return 1
 
   AIRFLOW_POD=$(kubectl get pod -l app=airflow --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
   SPARK_POD=$(kubectl get pod -l app=spark-master --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
@@ -772,47 +1417,44 @@ reentrenar_k8s() {
     return 1
   fi
 
-  info "Asegurando kubectl y script de entrenamiento..."
-  if [ ! -f /tmp/kubectl ]; then
-    curl -sL "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl" -o /tmp/kubectl
-    chmod +x /tmp/kubectl
-  fi
-  kubectl cp /tmp/kubectl $AIRFLOW_POD:/tmp/kubectl 2>/dev/null || true
-  kubectl exec $AIRFLOW_POD -- chmod +x /tmp/kubectl 2>/dev/null || true
+  info "Verificando kubectl dentro de Airflow..."
+  kubectl exec "$AIRFLOW_POD" -- test -x /usr/local/bin/kubectl ||
+    { err "Airflow K8s no tiene kubectl disponible"; return 1; }
 
   if [ -n "$SPARK_POD" ]; then
     kubectl exec $SPARK_POD -- test -f /app/jars/flight_prediction_2.13-0.1.jar 2>/dev/null \
       || warn "No se encuentra el JAR en /app/jars dentro de spark-master"
   fi
 
-  info "Asegurando scheduler activo..."
-  kubectl exec $AIRFLOW_POD -- bash -c "nohup airflow scheduler >> /tmp/scheduler.log 2>&1 &" 2>/dev/null || true
-  sleep 3
-
   info "Disparando DAG retrain_flight_delay_model..."
-  kubectl exec $AIRFLOW_POD -- airflow dags unpause retrain_flight_delay_model 2>/dev/null || true
-  kubectl exec $AIRFLOW_POD -- airflow dags trigger retrain_flight_delay_model 2>/dev/null \
-    && ok "DAG disparado correctamente" \
-    || warn "Error disparando DAG -- comprueba Airflow UI"
-
-  NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null)
-  info "Sigue el progreso en: http://$NODE_IP:30808 -> DAGs -> retrain_flight_delay_model"
-  info "MLflow: http://$NODE_IP:30502 -> flight_delay_prediction"
-  pause
+  kubectl exec "$AIRFLOW_POD" -- airflow dags trigger retrain_flight_delay_model >/dev/null ||
+    { err "Error disparando DAG K8s"; return 1; }
+  ok "DAG disparado correctamente"
+  wait_for_k8s_dag_success "$AIRFLOW_POD" || return 1
+  k8s_trainmodel_completed_on_worker ||
+    { err "El DAG termino, pero TrainModel no quedo demostrado en un worker"; return 1; }
+  wait_until 420 5 "predictor K8s tras reentrenamiento" k8s_predictor_streams_ready || return 1
+  run_e2e_k8s_check >/tmp/practica_retrain_k8s_e2e.json ||
+    { err "La prediccion K8s tras reentrenar fallo"; return 1; }
+  K8S_RETRAIN_UUID="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("id", ""))' \
+    < /tmp/practica_retrain_k8s_e2e.json 2>/dev/null)"
+  verify_k8s_prediction_sinks "$K8S_RETRAIN_UUID" || return 1
+  run_websocket_k8s_check ||
+    { err "La prediccion posterior al DAG no llego por WebSocket"; return 1; }
+  ok "Reentrenamiento K8s y prediccion posterior correctos"
 }
 
 apagar_k8s() {
   header "APAGANDO CLUSTER GKE"
   warn "Esto apaga los nodos del cluster (ahorra dinero)"
-  echo -n "  Confirmas? (s/N): "
-  read confirm
-  if [[ "$confirm" =~ ^[sS]$ ]]; then
-    gcloud container clusters resize $CLUSTER --num-nodes=0 --zone $ZONE --quiet
+  if confirm_action "Confirmas"; then
+    require_gcloud || return 1
+    gcloud container clusters resize "$CLUSTER" --num-nodes=0 --zone "$ZONE" --quiet || return 1
     ok "Cluster apagado"
   else
     info "Operacion cancelada"
+    return 1
   fi
-  pause
 }
 
 # ============================================================
@@ -821,10 +1463,10 @@ apagar_k8s() {
 
 parar_docker() {
   header "PARANDO DOCKER COMPOSE"
-  cd $PROJECT_HOME
-  docker compose stop
+  cd "$PROJECT_HOME" || return 1
+  require_docker || return 1
+  docker compose stop || return 1
   ok "Docker Compose parado"
-  pause
 }
 
 # ============================================================
@@ -856,6 +1498,7 @@ diag_cassandra() {
 }
 
 diag_kafka() {
+  local messages
   header "DIAGNOSTICO -- KAFKA"
 
   subheader "Topics activos"
@@ -872,18 +1515,29 @@ diag_kafka() {
     --bootstrap-server localhost:9092 \
     --describe --topic flight-delay-ml-response 2>/dev/null
 
-  subheader "Ultimos 3 mensajes en flight-delay-ml-response"
-  echo "  (Espera hasta 10s si no hay mensajes recientes)"
-  docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  subheader "Hasta 3 mensajes en flight-delay-ml-response"
+  messages="$(docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server localhost:9092 \
     --topic flight-delay-ml-response \
     --from-beginning --max-messages 3 \
-    --timeout-ms 10000 2>/dev/null | python3 -m json.tool 2>/dev/null || warn "Sin mensajes en el topic"
+    --timeout-ms 10000 2>/dev/null || true)"
+  if [ -n "$messages" ]; then
+    printf '%s\n' "$messages" | python3 -c '
+import json, sys
+for line in sys.stdin:
+    try:
+        print(json.dumps(json.loads(line), indent=2))
+    except json.JSONDecodeError:
+        print(line, end="")
+'
+  else
+    warn "Sin mensajes en el topic"
+  fi
 
-  subheader "Consumer group de Flask (WebSockets)"
+  subheader "Consumer groups activos"
   docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
-    --bootstrap-server localhost:9092 \
-    --describe --group flask-ws-1777393487 2>/dev/null
+    --bootstrap-server localhost:9092 --list 2>/dev/null ||
+    warn "No se pudieron listar consumer groups"
 
   pause
 }
@@ -917,20 +1571,29 @@ diag_minio() {
 diag_spark() {
   header "DIAGNOSTICO -- SPARK STREAMING"
 
-  subheader "Master efectivo del Spark Predictor"
+  local driver_id worker
+  driver_id="$(active_predictor_driver_id)"
+
+  subheader "Launcher del Spark Predictor"
   docker logs spark-predictor 2>&1 | grep "Spark master:" | tail -3
 
-  subheader "Estado del Spark Predictor (4 sinks)"
-  docker logs spark-predictor 2>&1 | grep -E "sink=|Sink|Stream started|MicroBatch|Started" | tail -10
+  subheader "Driver y cuatro streams"
+  if [ -n "$driver_id" ] && predictor_streams_ready; then
+    ok "Driver $driver_id RUNNING con cuatro streams activos"
+  else
+    err "El predictor no tiene cuatro streams activos"
+  fi
 
-  subheader "Micro-batches procesados"
-  docker logs spark-predictor 2>&1 | grep -E "Batch|batch|committed" | tail -10
+  subheader "Estado reciente del driver en workers"
+  for worker in spark-worker-1 spark-worker-2; do
+    echo "  $worker:"
+    docker exec "$worker" sh -c \
+      "test -n '$driver_id' && grep -E 'Stream started from|MicroBatch|committed|ERROR|Exception' /opt/spark/work/$driver_id/stderr 2>/dev/null | tail -8" ||
+      true
+  done
 
   subheader "Workers conectados al master"
   docker logs spark-master 2>&1 | grep -E "worker|Worker|registered|Registered" | tail -8
-
-  subheader "Errores recientes en Spark"
-  docker logs spark-predictor 2>&1 | grep "ERROR" | tail -10
 
   pause
 }
@@ -997,7 +1660,8 @@ diag_pipeline_completo() {
   echo "$TOPICS" | grep -q "flight-delay-ml-request" && ok "Kafka topic request existe" || err "Topic request no encontrado"
   echo "$TOPICS" | grep -q "flight-delay-ml-response" && ok "Kafka topic response existe" || err "Topic response no encontrado"
 
-  CASS_COUNT=$(docker exec cassandra cqlsh -e "SELECT COUNT(*) FROM agile_data_science.origin_dest_distances;" 2>/dev/null | grep -E "[0-9]+" | tr -d ' ')
+  CASS_COUNT=$(docker exec cassandra cqlsh -e "SELECT COUNT(*) FROM agile_data_science.origin_dest_distances;" 2>/dev/null \
+    | awk '/^[[:space:]]*[0-9]+[[:space:]]*$/ { gsub(/[[:space:]]/, ""); print; exit }')
   [ "$CASS_COUNT" = "4696" ] && ok "Cassandra: 4696 distancias cargadas" || warn "Cassandra: $CASS_COUNT distancias (esperado 4696)"
 
   MONGO_COUNT=$(docker exec mongo mongosh --quiet agile_data_science \
@@ -1014,8 +1678,11 @@ diag_pipeline_completo() {
   FLASK_METRICS=$(curl -s http://localhost:5001/metrics 2>/dev/null | grep -c "flight_requests_total")
   [ "$FLASK_METRICS" -gt "0" ] && ok "Flask /metrics activo (prometheus-flask-exporter)" || err "Flask /metrics no disponible"
 
-  SPARK_RUNNING=$(docker logs spark-predictor 2>&1 | grep -c "Stream started" 2>/dev/null)
-  [ "$SPARK_RUNNING" -gt "0" ] && ok "Spark Streaming activo ($SPARK_RUNNING streams)" || warn "Spark Streaming: verificar logs"
+  if predictor_streams_ready; then
+    ok "Spark Streaming activo: cuatro streams confirmados en el driver"
+  else
+    err "Spark Streaming no tiene los cuatro streams activos"
+  fi
 
   pause
 }
@@ -1033,42 +1700,53 @@ diag_websockets() {
   docker logs flask 2>&1 | grep "classify_realtime" | tail -10
 
   subheader "Prueba end-to-end -- enviar prediccion y verificar respuesta Kafka"
-  echo ""
-  echo "  Enviando prediccion de prueba..."
-  curl -s -X POST http://localhost:5001/flights/delays/predict/classify_realtime \
-    -d "DepDelay=15&Carrier=AA&FlightDate=2016-12-25&Origin=ATL&Dest=SFO&FlightNum=1234" \
-    > /tmp/pred_response.json 2>/dev/null
-  UUID_RESP=$(cat /tmp/pred_response.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id','ERROR'))" 2>/dev/null)
-  ok "Prediccion enviada con UUID: $UUID_RESP"
-
-  echo ""
-  echo "  Esperando respuesta de Spark via Kafka (10s)..."
-  sleep 10
-
-  RESULT=$(curl -s "http://localhost:5001/flights/delays/predict/classify_realtime/response/$UUID_RESP" 2>/dev/null)
-  STATUS=$(echo $RESULT | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','?'))" 2>/dev/null)
-  if [ "$STATUS" = "OK" ]; then
-    PRED=$(echo $RESULT | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('prediction',{}).get('Prediction','?'))" 2>/dev/null)
-    ok "Prediccion recibida: categoria $PRED -- Pipeline WebSocket/Kafka FUNCIONA"
-  else
-    warn "Estado: $STATUS -- puede que Spark aun este procesando"
+  local result
+  if result="$(run_e2e_docker_check)"; then
+    ok "Prediccion recibida por el pipeline Flask/Kafka/Spark"
+    echo "  $result"
+    pause
+    return 0
   fi
-
+  err "No se recibio respuesta del pipeline en 120 segundos"
   pause
+  return 1
 }
 
 diag_mlflow() {
   header "DIAGNOSTICO -- MLFLOW"
 
+  local experiments experiment_ids payload runs
   subheader "Experimentos registrados"
-  curl -s http://localhost:5002/api/2.0/mlflow/experiments/list | \
-    python3 -m json.tool 2>/dev/null | grep -E "name|experiment_id" | head -10 || err "MLflow no disponible"
+  experiments="$(curl -fsS http://localhost:5002/api/2.0/mlflow/experiments/search \
+    -H "Content-Type: application/json" -d '{"max_results": 100}' 2>/dev/null)" ||
+    { err "MLflow no disponible"; pause; return 1; }
+  printf "%s" "$experiments" | python3 -c '
+import json, sys
+for experiment in json.load(sys.stdin).get("experiments", []):
+    print("  {}: {}".format(experiment.get("experiment_id"), experiment.get("name")))
+' || { err "Respuesta de experimentos MLflow invalida"; pause; return 1; }
 
   subheader "Ultimas ejecuciones (runs)"
-  curl -s "http://localhost:5002/api/2.0/mlflow/runs/search" \
-    -H "Content-Type: application/json" \
-    -d '{"max_results": 5}' | \
-    python3 -m json.tool 2>/dev/null | grep -E "run_id|status|start_time|run_name" | head -20
+  experiment_ids="$(printf "%s" "$experiments" | python3 -c '
+import json, sys
+print(",".join(e["experiment_id"] for e in json.load(sys.stdin).get("experiments", [])))
+')"
+  [ -n "$experiment_ids" ] || { err "MLflow no tiene experimentos"; pause; return 1; }
+  payload="$(EXPERIMENT_IDS="$experiment_ids" python3 -c '
+import json, os
+print(json.dumps({"experiment_ids": os.environ["EXPERIMENT_IDS"].split(","), "max_results": 5, "order_by": ["attributes.start_time DESC"]}))
+')"
+  runs="$(curl -fsS http://localhost:5002/api/2.0/mlflow/runs/search \
+    -H "Content-Type: application/json" -d "$payload" 2>/dev/null)" ||
+    { err "No se pudieron consultar runs MLflow"; pause; return 1; }
+  printf "%s" "$runs" | python3 -c '
+import json, sys
+runs = json.load(sys.stdin).get("runs", [])
+for run in runs:
+    info = run.get("info", {})
+    print("  {} status={} start={}".format(info.get("run_id"), info.get("status"), info.get("start_time")))
+raise SystemExit(0 if runs else 1)
+' || { err "MLflow no contiene runs"; pause; return 1; }
 
   pause
 }
@@ -1093,7 +1771,7 @@ diag_test_e2e_docker() {
 
   local endpoint="http://localhost:5001/flights/delays/predict/classify_realtime"
   local payload="DepDelay=15&Carrier=AA&FlightDate=2016-12-25&Origin=ATL&Dest=SFO&FlightNum=1234"
-  local response body http_code uuid result result_body status prediction label
+  local response body http_code uuid result result_body status prediction label failures=0
 
   info "Enviando prediccion a Flask Docker..."
   response=$(curl -s -w "\nHTTP_CODE=%{http_code}\n" -X POST "$endpoint" -d "$payload" 2>/dev/null)
@@ -1106,7 +1784,7 @@ diag_test_e2e_docker() {
     fail_check "Flask no respondio correctamente (HTTP ${http_code:-N/A})"
     echo "$body"
     pause
-    return
+    return 1
   fi
 
   uuid=$(JSON_BODY="$body" python3 -c 'import os,json; d=json.loads(os.environ.get("JSON_BODY","{}")); print(d.get("id",""))' 2>/dev/null)
@@ -1114,7 +1792,7 @@ diag_test_e2e_docker() {
     fail_check "No se pudo extraer UUID de la respuesta"
     echo "$body"
     pause
-    return
+    return 1
   fi
   pass_check "UUID generado: $uuid"
 
@@ -1132,6 +1810,7 @@ diag_test_e2e_docker() {
     pass_check "Respuesta recibida por polling REST"
   else
     fail_check "No se recibio respuesta en 60s"
+    failures=$((failures + 1))
   fi
 
   prediction=$(JSON_BODY="$result_body" python3 -c 'import os,json; d=json.loads(os.environ.get("JSON_BODY","{}")); print(d.get("prediction",{}).get("Prediction",""))' 2>/dev/null)
@@ -1149,19 +1828,20 @@ diag_test_e2e_docker() {
   local mongo_count cassandra_hit kafka_hit
   mongo_count=$(docker exec mongo mongosh --quiet agile_data_science \
     --eval "db.flight_delay_ml_response.countDocuments({UUID: '$uuid'})" 2>/dev/null | tail -1 | tr -d '[:space:]')
-  [ "${mongo_count:-0}" -gt 0 ] 2>/dev/null && pass_check "MongoDB contiene UUID $uuid" || fail_check "MongoDB no contiene UUID $uuid"
+  if [ "${mongo_count:-0}" -gt 0 ] 2>/dev/null; then pass_check "MongoDB contiene UUID $uuid"; else fail_check "MongoDB no contiene UUID $uuid"; failures=$((failures + 1)); fi
 
   cassandra_hit=$(docker exec cassandra cqlsh -e \
     "SELECT uuid FROM agile_data_science.flight_delay_classification_response WHERE uuid='$uuid';" 2>/dev/null | grep "$uuid" | head -1)
-  [ -n "$cassandra_hit" ] && pass_check "Cassandra contiene UUID $uuid" || fail_check "Cassandra no contiene UUID $uuid"
+  if [ -n "$cassandra_hit" ]; then pass_check "Cassandra contiene UUID $uuid"; else fail_check "Cassandra no contiene UUID $uuid"; failures=$((failures + 1)); fi
 
   kafka_hit=$(docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server localhost:9092 \
     --topic flight-delay-ml-response \
     --from-beginning --timeout-ms 5000 --max-messages 1000 2>/dev/null | grep "$uuid" | tail -1)
-  [ -n "$kafka_hit" ] && pass_check "Kafka response topic contiene UUID $uuid" || fail_check "Kafka response topic no muestra UUID $uuid"
+  if [ -n "$kafka_hit" ]; then pass_check "Kafka response topic contiene UUID $uuid"; else fail_check "Kafka response topic no muestra UUID $uuid"; failures=$((failures + 1)); fi
 
   pause
+  [ "$failures" -eq 0 ]
 }
 
 diag_test_e2e_k8s() {
@@ -1170,15 +1850,15 @@ diag_test_e2e_k8s() {
   if ! command -v kubectl >/dev/null 2>&1; then
     err "kubectl no esta disponible"
     pause
-    return
+    return 1
   fi
 
-  local node_ip endpoint payload response body http_code uuid result result_body status prediction label
+  local node_ip endpoint payload response body http_code uuid result result_body status prediction label failures=0
   node_ip=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null)
   if [ -z "$node_ip" ]; then
     err "No se pudo obtener la IP externa del nodo GKE"
     pause
-    return
+    return 1
   fi
 
   endpoint="http://$node_ip:30001/flights/delays/predict/classify_realtime"
@@ -1195,7 +1875,7 @@ diag_test_e2e_k8s() {
     fail_check "Flask K8s no respondio correctamente (HTTP ${http_code:-N/A})"
     echo "$body"
     pause
-    return
+    return 1
   fi
 
   uuid=$(JSON_BODY="$body" python3 -c 'import os,json; d=json.loads(os.environ.get("JSON_BODY","{}")); print(d.get("id",""))' 2>/dev/null)
@@ -1203,7 +1883,7 @@ diag_test_e2e_k8s() {
     fail_check "No se pudo extraer UUID de la respuesta"
     echo "$body"
     pause
-    return
+    return 1
   fi
   pass_check "UUID generado: $uuid"
 
@@ -1221,6 +1901,7 @@ diag_test_e2e_k8s() {
     pass_check "Respuesta recibida por polling REST"
   else
     fail_check "No se recibio respuesta en 60s"
+    failures=$((failures + 1))
   fi
 
   prediction=$(JSON_BODY="$result_body" python3 -c 'import os,json; d=json.loads(os.environ.get("JSON_BODY","{}")); print(d.get("prediction",{}).get("Prediction",""))' 2>/dev/null)
@@ -1238,19 +1919,27 @@ diag_test_e2e_k8s() {
   local mongo_count cassandra_hit kafka_hit
   mongo_count=$(kubectl exec deployment/mongo -- mongosh --quiet agile_data_science \
     --eval "db.flight_delay_ml_response.countDocuments({UUID: '$uuid'})" 2>/dev/null | tail -1 | tr -d '[:space:]')
-  [ "${mongo_count:-0}" -gt 0 ] 2>/dev/null && pass_check "MongoDB K8s contiene UUID $uuid" || fail_check "MongoDB K8s no contiene UUID $uuid"
+  if [ "${mongo_count:-0}" -gt 0 ] 2>/dev/null; then pass_check "MongoDB K8s contiene UUID $uuid"; else fail_check "MongoDB K8s no contiene UUID $uuid"; failures=$((failures + 1)); fi
 
   cassandra_hit=$(kubectl exec deployment/cassandra -- cqlsh -e \
     "SELECT uuid FROM agile_data_science.flight_delay_classification_response WHERE uuid='$uuid';" 2>/dev/null | grep "$uuid" | head -1)
-  [ -n "$cassandra_hit" ] && pass_check "Cassandra K8s contiene UUID $uuid" || fail_check "Cassandra K8s no contiene UUID $uuid"
+  if [ -n "$cassandra_hit" ]; then pass_check "Cassandra K8s contiene UUID $uuid"; else fail_check "Cassandra K8s no contiene UUID $uuid"; failures=$((failures + 1)); fi
 
   kafka_hit=$(kubectl exec deployment/kafka -- /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server localhost:9092 \
     --topic flight-delay-ml-response \
     --from-beginning --timeout-ms 5000 --max-messages 1000 2>/dev/null | grep "$uuid" | tail -1)
-  [ -n "$kafka_hit" ] && pass_check "Kafka K8s response topic contiene UUID $uuid" || fail_check "Kafka K8s response topic no muestra UUID $uuid"
+  if [ -n "$kafka_hit" ]; then pass_check "Kafka K8s response topic contiene UUID $uuid"; else fail_check "Kafka K8s response topic no muestra UUID $uuid"; failures=$((failures + 1)); fi
+
+  if run_websocket_k8s_check; then
+    pass_check "WebSocket K8s real entrego prediction_response"
+  else
+    fail_check "WebSocket K8s real no entrego prediction_response"
+    failures=$((failures + 1))
+  fi
 
   pause
+  [ "$failures" -eq 0 ]
 }
 
 diag_deploy_mode_cluster() {
@@ -1349,7 +2038,8 @@ PY
 diag_versiones() {
   header "VERIFICACION DE VERSIONES DEL ENUNCIADO"
 
-  local spark_out spark_real scala_real kafka_version kafka_real mongo_real cassandra_real airflow_real mlflow_real python_real jar_classes
+  local spark_out spark_real scala_real kafka_version kafka_real mongo_real cassandra_real airflow_real mlflow_real
+  local python_flask_real python_spark_real python_airflow_real iceberg_real jar_classes failures=0
   local zookeeper_count kafka_proc
 
   spark_out=$(docker exec spark-master /opt/spark/bin/spark-submit --version 2>&1)
@@ -1368,9 +2058,14 @@ diag_versiones() {
   airflow_real=$(docker exec airflow airflow version 2>/dev/null | head -1)
   mlflow_real=$(docker exec mlflow mlflow --version 2>/dev/null | awk '{print $3}' | head -1)
   if [ -z "$mlflow_real" ]; then
-    mlflow_real=$(curl -s http://localhost:5002/api/2.0/mlflow/experiments/search -H 'Content-Type: application/json' -d '{}' 2>/dev/null | python3 -c "import sys,json; json.load(sys.stdin); print('API OK')" 2>/dev/null)
+    mlflow_real=$(curl -s http://localhost:5002/api/2.0/mlflow/experiments/search -H 'Content-Type: application/json' -d '{"max_results":1}' 2>/dev/null | python3 -c "import sys,json; json.load(sys.stdin); print('API OK')" 2>/dev/null)
   fi
-  python_real=$(python3 --version 2>/dev/null | awk '{print $2}')
+  python_flask_real=$(docker exec flask python3 --version 2>/dev/null | awk '{print $2}')
+  python_spark_real=$(docker exec spark-master python3 --version 2>/dev/null | awk '{print $2}')
+  python_airflow_real=$(docker exec airflow python --version 2>/dev/null | awk '{print $2}')
+  iceberg_real=$(docker exec spark-master sh -c \
+    "ls /opt/spark/jars/*iceberg-spark-runtime*1.10.1*.jar" 2>/dev/null |
+    sed -nE 's/.*-([0-9]+\.[0-9]+\.[0-9]+)\.jar/\1/p' | head -1)
   jar_classes=$(jar tf shared-jars/flight_prediction_2.13-0.1.jar 2>/dev/null | grep -c '\.class')
 
   printf "  %-14s | %-24s | %-36s | %s\n" "Componente" "Version esperada" "Version real" "Estado"
@@ -1381,6 +2076,7 @@ diag_versiones() {
       state="${GREEN}✓${NC}"
     else
       state="${RED}✗${NC}"
+      failures=$((failures + 1))
     fi
     printf "  %-14s | %-24s | %-36s | %b\n" "$component" "$expected" "${real:-N/A}" "$state"
   }
@@ -1392,7 +2088,10 @@ diag_versiones() {
   version_row "Cassandra" "4.1" "$cassandra_real" "[[ \"$cassandra_real\" == 4.1* ]]"
   version_row "Airflow" "2.10.4" "$airflow_real" "[[ \"$airflow_real\" == \"2.10.4\" ]]"
   version_row "MLflow" "2.19.0" "$mlflow_real" "[[ \"$mlflow_real\" == \"2.19.0\" || \"$mlflow_real\" == \"API OK\" ]]"
-  version_row "Python" "3.10+" "$python_real" "[[ \"$python_real\" == 3.10* || \"$python_real\" == 3.11* || \"$python_real\" == 3.12* || \"$python_real\" == 3.13* ]]"
+  version_row "Python Flask" "3.10.x" "$python_flask_real" "[[ \"$python_flask_real\" == 3.10.* ]]"
+  version_row "Python Spark" "3.10.x" "$python_spark_real" "[[ \"$python_spark_real\" == 3.10.* ]]"
+  version_row "Python Airflow" "3.10.x" "$python_airflow_real" "[[ \"$python_airflow_real\" == 3.10.* ]]"
+  version_row "Iceberg" "1.10.1" "$iceberg_real" "[[ \"$iceberg_real\" == \"1.10.1\" ]]"
 
   echo ""
   echo "  JAR classes: ${jar_classes:-0}"
@@ -1400,9 +2099,86 @@ diag_versiones() {
     pass_check "KRaft mode confirmado (sin Zookeeper)"
   else
     warn "Verificar modo Kafka: no se pudo confirmar KRaft completamente"
+    failures=$((failures + 1))
   fi
 
   pause
+  [ "$failures" -eq 0 ]
+}
+
+diag_versiones_k8s() {
+  header "VERIFICACION DE VERSIONES -- KUBERNETES"
+  kubectl cluster-info >/dev/null 2>&1 ||
+    { err "No hay un cluster Kubernetes accesible"; return 1; }
+
+  local spark_out spark_real scala_real kafka_real kafka_proc mongo_real cassandra_real
+  local airflow_real mlflow_real python_flask_real python_spark_real python_airflow_real iceberg_real failures=0
+
+  spark_out="$(kubectl exec deployment/spark-master -- /opt/spark/bin/spark-submit --version 2>&1)"
+  spark_real="$(printf '%s\n' "$spark_out" | grep -oE 'version [0-9]+\.[0-9]+\.[0-9]+' | head -1 | awk '{print $2}')"
+  scala_real="$(printf '%s\n' "$spark_out" | sed -nE 's/.*Scala version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -1)"
+  kafka_real="$(kubectl exec deployment/kafka -- /opt/kafka/bin/kafka-topics.sh --version 2>/dev/null | head -1)"
+  kafka_proc="$(kubectl exec deployment/kafka -- ps aux 2>/dev/null | grep -v grep | grep kafka | grep -v zookeeper | head -1 || true)"
+  mongo_real="$(kubectl exec deployment/mongo -- mongosh --quiet --eval 'db.version()' 2>/dev/null | head -1)"
+  cassandra_real="$(kubectl exec deployment/cassandra -- cqlsh -e \
+    'SELECT release_version FROM system.local;' 2>/dev/null |
+    grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  airflow_real="$(kubectl exec deployment/airflow -- airflow version 2>/dev/null | head -1)"
+  mlflow_real="$(kubectl exec deployment/mlflow -- mlflow --version 2>/dev/null | awk '{print $3}' | head -1)"
+  python_flask_real="$(kubectl exec deployment/flask -- python3 --version 2>/dev/null | awk '{print $2}')"
+  python_spark_real="$(kubectl exec deployment/spark-master -- python3 --version 2>/dev/null | awk '{print $2}')"
+  python_airflow_real="$(kubectl exec deployment/airflow -- python --version 2>/dev/null | awk '{print $2}')"
+  iceberg_real="$(kubectl exec deployment/spark-master -- sh -c \
+    'ls /opt/spark/jars/*iceberg-spark-runtime*1.10.1*.jar' 2>/dev/null |
+    sed -nE 's/.*-([0-9]+\.[0-9]+\.[0-9]+)\.jar/\1/p' | head -1)"
+
+  printf "  %-14s | %-20s | %-24s | %s\n" "Componente" "Version esperada" "Version real" "Estado"
+  printf "  %-14s-+-%-20s-+-%-24s-+-%s\n" "--------------" "--------------------" "------------------------" "------"
+  k8s_version_row() {
+    local component="$1" expected="$2" real="$3" matches="$4"
+    if [ "$matches" = "0" ]; then
+      printf "  %-14s | %-20s | %-24s | %b\n" "$component" "$expected" "${real:-N/A}" "${GREEN}✓${NC}"
+    else
+      printf "  %-14s | %-20s | %-24s | %b\n" "$component" "$expected" "${real:-N/A}" "${RED}✗${NC}"
+      failures=$((failures + 1))
+    fi
+  }
+
+  [[ "$spark_real" == "4.1.1" ]]; k8s_version_row "Spark" "4.1.1" "$spark_real" "$?"
+  [[ "$scala_real" == 2.13.* ]]; k8s_version_row "Scala" "2.13.x" "$scala_real" "$?"
+  [[ "$kafka_real" == "4.2.0" && -n "$kafka_proc" ]]; k8s_version_row "Kafka KRaft" "4.2.0" "$kafka_real" "$?"
+  [[ "$mongo_real" == "7.0.17" ]]; k8s_version_row "MongoDB" "7.0.17" "$mongo_real" "$?"
+  [[ "$cassandra_real" == 4.1.* ]]; k8s_version_row "Cassandra" "4.1.x" "$cassandra_real" "$?"
+  [[ "$airflow_real" == "2.10.4" ]]; k8s_version_row "Airflow" "2.10.4" "$airflow_real" "$?"
+  [[ "$mlflow_real" == "2.19.0" ]]; k8s_version_row "MLflow" "2.19.0" "$mlflow_real" "$?"
+  [[ "$python_flask_real" == 3.10.* ]]; k8s_version_row "Python Flask" "3.10.x" "$python_flask_real" "$?"
+  [[ "$python_spark_real" == 3.10.* ]]; k8s_version_row "Python Spark" "3.10.x" "$python_spark_real" "$?"
+  [[ "$python_airflow_real" == 3.10.* ]]; k8s_version_row "Python Airflow" "3.10.x" "$python_airflow_real" "$?"
+  [[ "$iceberg_real" == "1.10.1" ]]; k8s_version_row "Iceberg" "1.10.1" "$iceberg_real" "$?"
+
+  pause
+  [ "$failures" -eq 0 ]
+}
+
+dispatch_diagnostic_option() {
+  case "${1:-}" in
+    1) diag_pipeline_completo ;;
+    2) diag_cassandra ;;
+    3) diag_kafka ;;
+    4) diag_websockets ;;
+    5) diag_minio ;;
+    6) diag_spark ;;
+    7) diag_mongodb ;;
+    8) diag_prometheus ;;
+    9) diag_mlflow ;;
+    a|A) diag_airflow ;;
+    b|B) diag_test_e2e_docker ;;
+    c|C) diag_test_e2e_k8s ;;
+    d|D) diag_deploy_mode_cluster ;;
+    e|E) diag_versiones ;;
+    f|F) diag_versiones_k8s ;;
+    *) err "Opcion de diagnostico no valida: ${1:-vacia}"; return 2 ;;
+  esac
 }
 
 menu_diagnostico() {
@@ -1428,31 +2204,18 @@ menu_diagnostico() {
     echo -e "  ${GREEN}c)${NC} Test end-to-end automatico K8s"
     echo -e "  ${GREEN}d)${NC} Diagnostico deploy-mode cluster"
     echo -e "  ${GREEN}e)${NC} Verificar versiones del enunciado"
+    echo -e "  ${GREEN}f)${NC} Verificar versiones en Kubernetes"
     echo ""
     echo -e "  ${GREEN}0)${NC} Volver al menu principal"
     echo -e "${BOLD}${MAGENTA}============================================${NC}"
     echo ""
     echo -n "  Selecciona una opcion: "
-    read subopcion
+    if ! read subopcion; then
+      break
+    fi
 
-    case $subopcion in
-      1) diag_pipeline_completo ;;
-      2) diag_cassandra ;;
-      3) diag_kafka ;;
-      4) diag_websockets ;;
-      5) diag_minio ;;
-      6) diag_spark ;;
-      7) diag_mongodb ;;
-      8) diag_prometheus ;;
-      9) diag_mlflow ;;
-      a|A) diag_airflow ;;
-      b|B) diag_test_e2e_docker ;;
-      c|C) diag_test_e2e_k8s ;;
-      d|D) diag_deploy_mode_cluster ;;
-      e|E) diag_versiones ;;
-      0) break ;;
-      *) warn "Opcion no valida" ;;
-    esac
+    [ "$subopcion" = "0" ] && break
+    dispatch_diagnostic_option "$subopcion" || warn "El diagnostico termino con errores"
   done
 }
 
@@ -1485,6 +2248,67 @@ logs_flask_metrics() {
   pause
 }
 
+dispatch_log_option() {
+  local logop="${1:-}" lines="${LOG_LINES:-50}" svc
+  case "$logop" in
+    1)
+      header "LOGS -- FLASK"
+      docker logs flask --tail="$lines" 2>&1
+      pause ;;
+    2)
+      header "LOGS -- SPARK PREDICTOR"
+      docker logs spark-predictor --tail="$lines" 2>&1
+      pause ;;
+    3)
+      header "LOGS -- SPARK MASTER"
+      docker logs spark-master --tail="$lines" 2>&1
+      pause ;;
+    4)
+      header "LOGS -- KAFKA"
+      docker logs kafka --tail="$lines" 2>&1
+      pause ;;
+    5)
+      header "LOGS -- MONGODB"
+      docker logs mongo --tail="$lines" 2>&1
+      pause ;;
+    6)
+      header "LOGS -- CASSANDRA"
+      docker logs cassandra --tail="$lines" 2>&1
+      pause ;;
+    7)
+      header "LOGS -- MINIO"
+      docker logs minio --tail="$lines" 2>&1
+      pause ;;
+    8)
+      header "LOGS -- AIRFLOW"
+      docker logs airflow --tail="$lines" 2>&1
+      pause ;;
+    9)
+      header "LOGS -- MLFLOW"
+      docker logs mlflow --tail="$lines" 2>&1
+      pause ;;
+    a|A)
+      header "LOGS -- PROMETHEUS"
+      docker logs prometheus --tail="$lines" 2>&1
+      pause ;;
+    b|B)
+      header "LOGS -- GRAFANA"
+      docker logs grafana --tail="$lines" 2>&1
+      pause ;;
+    c|C)
+      header "LOGS -- TODOS LOS SERVICIOS"
+      for svc in flask spark-predictor spark-master kafka mongo cassandra minio airflow mlflow prometheus grafana; do
+        subheader "$svc"
+        docker logs "$svc" --tail=5 2>&1
+      done
+      pause ;;
+    d|D) logs_spark_worker_driver "spark-worker-1" ;;
+    e|E) logs_spark_worker_driver "spark-worker-2" ;;
+    f|F) logs_flask_metrics ;;
+    *) err "Opcion de logs no valida: ${logop:-vacia}"; return 2 ;;
+  esac
+}
+
 menu_logs() {
   while true; do
     clear
@@ -1513,70 +2337,12 @@ menu_logs() {
     echo -e "${BOLD}${YELLOW}============================================${NC}"
     echo ""
     echo -n "  Selecciona servicio: "
-    read logop
+    if ! read logop; then
+      break
+    fi
 
-    LINES=50
-    case $logop in
-      1)
-        header "LOGS -- FLASK"
-        docker logs flask --tail=$LINES 2>&1
-        pause ;;
-      2)
-        header "LOGS -- SPARK PREDICTOR"
-        docker logs spark-predictor --tail=$LINES 2>&1
-        pause ;;
-      3)
-        header "LOGS -- SPARK MASTER"
-        docker logs spark-master --tail=$LINES 2>&1
-        pause ;;
-      4)
-        header "LOGS -- KAFKA"
-        docker logs kafka --tail=$LINES 2>&1
-        pause ;;
-      5)
-        header "LOGS -- MONGODB"
-        docker logs mongo --tail=$LINES 2>&1
-        pause ;;
-      6)
-        header "LOGS -- CASSANDRA"
-        docker logs cassandra --tail=$LINES 2>&1
-        pause ;;
-      7)
-        header "LOGS -- MINIO"
-        docker logs minio --tail=$LINES 2>&1
-        pause ;;
-      8)
-        header "LOGS -- AIRFLOW"
-        docker logs airflow --tail=$LINES 2>&1
-        pause ;;
-      9)
-        header "LOGS -- MLFLOW"
-        docker logs mlflow --tail=$LINES 2>&1
-        pause ;;
-      a|A)
-        header "LOGS -- PROMETHEUS"
-        docker logs prometheus --tail=$LINES 2>&1
-        pause ;;
-      b|B)
-        header "LOGS -- GRAFANA"
-        docker logs grafana --tail=$LINES 2>&1
-        pause ;;
-      c|C)
-        header "LOGS -- TODOS LOS SERVICIOS"
-        for svc in flask spark-predictor spark-master kafka mongo cassandra minio airflow mlflow prometheus grafana; do
-          subheader "$svc"
-          docker logs $svc --tail=5 2>&1
-        done
-        pause ;;
-      d|D)
-        logs_spark_worker_driver "spark-worker-1" ;;
-      e|E)
-        logs_spark_worker_driver "spark-worker-2" ;;
-      f|F)
-        logs_flask_metrics ;;
-      0) break ;;
-      *) warn "Opcion no valida" ;;
-    esac
+    [ "$logop" = "0" ] && break
+    dispatch_log_option "$logop" || warn "No se pudieron obtener los logs solicitados"
   done
 }
 
@@ -1584,39 +2350,81 @@ limpiar_checkpoints_docker() {
   header "LIMPIAR CHECKPOINTS S3A -- DOCKER"
   info "Limpiando checkpoints S3A del predictor..."
   warn "Esto requiere reiniciar el predictor"
-  echo -n "  Confirmas? (s/N): "
-  read confirm
+  cd "$PROJECT_HOME" || return 1
+  require_docker || return 1
 
-  if [[ "$confirm" =~ ^[sS]$ ]]; then
-    docker compose --profile predictor stop spark-predictor 2>/dev/null || true
-
-    local driver_id
-    driver_id=$(curl -s http://localhost:8080/json/ | python3 -c 'import sys,json; d=json.load(sys.stdin); drivers=[x for x in d.get("activedrivers",[]) if "MakePrediction" in x.get("mainclass","")]; print(drivers[0]["id"] if drivers else "")' 2>/dev/null)
-    if [ -n "$driver_id" ]; then
-      if docker exec spark-master curl -s -X POST "http://spark-master:6066/v1/submissions/kill/$driver_id" >/dev/null 2>&1; then
-        ok "Driver $driver_id eliminado"
-      elif docker exec spark-master python3 -c "import urllib.request; urllib.request.urlopen('http://spark-master:6066/v1/submissions/kill/$driver_id', data=b'')" >/dev/null 2>&1; then
-        ok "Driver $driver_id eliminado"
-      else
-        warn "No se pudo confirmar la eliminacion del driver $driver_id"
-      fi
-    else
-      warn "No hay driver MakePrediction activo"
-    fi
-
-    docker exec minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null && mc rm --recursive --force local/flight-data/checkpoints/predictor/ 2>/dev/null && echo 'Checkpoints eliminados' || echo 'No habia checkpoints'"
-    docker compose --profile predictor up -d spark-predictor
+  if confirm_action "Confirmas"; then
+    docker compose --profile predictor stop spark-predictor >/dev/null 2>&1 || true
+    kill_predictor_drivers_docker || { err "No se pudo detener el driver MakePrediction"; return 1; }
+    docker exec minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc rm --recursive --force local/flight-data/checkpoints/predictor/ >/dev/null 2>&1 || true" ||
+      return 1
+    docker compose --profile predictor up -d spark-predictor || return 1
+    wait_until 300 5 "predictor tras limpiar checkpoints" predictor_streams_ready || return 1
     ok "Predictor reiniciado con checkpoints limpios"
   else
     info "Operacion cancelada"
+    return 1
   fi
-
-  pause
 }
 
 # ============================================================
-#   MENU PRINCIPAL
+#   CLI Y MENU PRINCIPAL
 # ============================================================
+
+print_usage() {
+  cat <<'EOF'
+Uso:
+  ./practica.sh                    Menu interactivo
+  ./practica.sh OPCION             Ejecuta una opcion principal sin pausas
+  ./practica.sh 10 SUBOPCION       Ejecuta un diagnostico sin pausas
+  ./practica.sh 11 SUBOPCION       Muestra logs sin pausas
+
+Opciones principales: 1..9
+Diagnosticos: 1..9, a..f
+Logs: 1..9, a..f
+
+Variables utiles:
+  PROJECT_HOME, ZONE, CLUSTER, K8S_NODE_COUNT, IMAGE_TAG
+  K8S_FIREWALL_RULE, K8S_FIREWALL_SOURCE_RANGES
+  PRACTICA_ASSUME_YES=1 para confirmar opciones destructivas no interactivas
+  LOG_LINES=100 para cambiar el numero de lineas de log
+EOF
+}
+
+dispatch_main_option() {
+  local option="${1:-}" suboption="${2:-}"
+  case "$option" in
+    1) arrancar_docker ;;
+    2) arrancar_k8s ;;
+    3) reentrenar_docker ;;
+    4) reentrenar_k8s ;;
+    5) show_urls_docker ;;
+    6) show_urls_k8s ;;
+    7) apagar_k8s ;;
+    8) parar_docker ;;
+    9) limpiar_checkpoints_docker ;;
+    10)
+      if [ -n "$suboption" ]; then dispatch_diagnostic_option "$suboption"; else menu_diagnostico; fi
+      ;;
+    11)
+      if [ -n "$suboption" ]; then dispatch_log_option "$suboption"; else menu_logs; fi
+      ;;
+    0) info "Hasta luego!" ;;
+    -h|--help|help) print_usage ;;
+    *) err "Opcion principal no valida: ${option:-vacia}"; print_usage; return 2 ;;
+  esac
+}
+
+if [ "$#" -gt 0 ]; then
+  PRACTICA_NONINTERACTIVE=1
+  if { [ "$1" = "10" ] || [ "$1" = "11" ]; } && [ -z "${2:-}" ]; then
+    err "La opcion $1 requiere una subopcion en modo no interactivo"
+    print_usage
+    exit 2
+  fi
+  dispatch_main_option "$1" "${2:-}"
+  exit $?
+fi
 
 while true; do
   clear
@@ -1656,21 +2464,14 @@ while true; do
   echo -e "${BOLD}${BLUE}============================================${NC}"
   echo ""
   echo -n "  Selecciona una opcion: "
-  read opcion
-
-  case $opcion in
-    1) arrancar_docker ;;
-    2) arrancar_k8s ;;
-    3) reentrenar_docker ;;
-    4) reentrenar_k8s ;;
-    5) show_urls_docker ;;
-    6) show_urls_k8s ;;
-    7) apagar_k8s ;;
-    8) parar_docker ;;
-    9) limpiar_checkpoints_docker ;;
-    10) menu_diagnostico ;;
-    11) menu_logs ;;
-    0) echo ""; info "Hasta luego!"; echo ""; break ;;
-    *) warn "Opcion no valida" ;;
-  esac
+  if ! read opcion; then
+    break
+  fi
+  if [ "$opcion" = "0" ]; then
+    echo ""
+    info "Hasta luego!"
+    echo ""
+    break
+  fi
+  dispatch_main_option "$opcion" || warn "La opcion termino con errores"
 done

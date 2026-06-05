@@ -1,18 +1,40 @@
 #!/usr/bin/env bash
 
-# Get the absolute path of this script, see http://bit.ly/find_path
-ABSOLUTE_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-ABSOLUTE_DIR=$(dirname "${ABSOLUTE_PATH}")
+set -Eeuo pipefail
 
-# Extract to Agile_Data_Code_2/data/on_time_performance.parquet, wherever we are executed from
-cd $ABSOLUTE_DIR/../data/
-curl -Lko ./simple_flight_delay_features.jsonl.bz2 http://s3.amazonaws.com/agile_data_science/simple_flight_delay_features.jsonl.bz2
+PROJECT_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DATA_DIR="$PROJECT_HOME/data"
+BASE_URL="https://s3.amazonaws.com/agile_data_science"
 
-# Get the distances between pairs of airports
-curl -Lko ./origin_dest_distances.jsonl http://s3.amazonaws.com/agile_data_science/origin_dest_distances.jsonl
+download() {
+  local name="$1" destination="$2"
+  local temporary="${destination}.tmp"
+  echo "Descargando $name..."
+  curl --fail --location --retry 3 --retry-delay 2 --output "$temporary" "$BASE_URL/$name"
+  test -s "$temporary"
+  mv "$temporary" "$destination"
+}
 
-# Get the models to make ch08/web/predict_flask.py go
-cd $ABSOLUTE_DIR/..
-mkdir models
-curl -Lko ./models/sklearn_vectorizer.pkl http://s3.amazonaws.com/agile_data_science/sklearn_vectorizer.pkl
-curl -Lko ./models/sklearn_regressor.pkl http://s3.amazonaws.com/agile_data_science/sklearn_regressor.pkl
+ensure_checked_download() {
+  local name="$1" destination="$2" expected_sha256="$3"
+  if [ -s "$destination" ] &&
+     printf '%s  %s\n' "$expected_sha256" "$destination" | sha256sum --check --status; then
+    return 0
+  fi
+  rm -f "${destination}.tmp"
+  download "$name" "$destination"
+  printf '%s  %s\n' "$expected_sha256" "$destination" | sha256sum --check --status
+}
+
+mkdir -p "$DATA_DIR"
+
+ensure_checked_download \
+  simple_flight_delay_features.jsonl.bz2 \
+  "$DATA_DIR/simple_flight_delay_features.jsonl.bz2" \
+  "2dde67c56fcb06c8b279706152ee0051f33903c0ee86119e154febf8abbbf049"
+ensure_checked_download \
+  origin_dest_distances.jsonl \
+  "$DATA_DIR/origin_dest_distances.jsonl" \
+  "b8d2907f62b3a0facc9d35d27df52c87d08995db01844a089398eccee026d74e"
+
+echo "Datos descargados y verificados."
