@@ -26,7 +26,7 @@ Sistema Big Data para entrenar y servir predicciones de retraso de vuelos con Sp
 | Kafka + Cassandra + WebSockets | 1 | ✅ | `MakePrediction` escribe en `flight-delay-ml-response` y Cassandra; Flask presenta la respuesta mediante WebSockets. |
 | TrainModel lee/guarda Lakehouse | 1 | ✅ | `TrainModel.scala` lee `minio.flights.training_data` y guarda modelos en `s3a://flight-data/models`. |
 | Docker Compose completo | 1 | ✅ | Servicios dockerizados, Spark Standalone y predictor en `deploy-mode cluster`. |
-| K8s GKE completo | 3 | ✅ | Escenario completo desplegable en GKE y `deploy-mode cluster` verificable desde la API/UI de Spark. |
+| K8s GKE completo | 3 | ✅ | Escenario completo verificado end-to-end en GKE: `deploy-mode cluster`, predicción, Kafka, Cassandra, MongoDB, WebSocket y NodePorts. |
 | Airflow + MLflow Docker | 1 | ✅ | Airflow orquesta reentrenamientos Spark y MLflow registra parámetros, métricas y estado. |
 | GCloud | 1 | ✅ | VM de Compute Engine, GKE y Artifact Registry dentro del mismo proyecto de Google Cloud. |
 | Observabilidad | 1 | ✅ | Prometheus, Grafana, métricas Flask y diagnósticos automáticos en `practica.sh`. |
@@ -62,6 +62,8 @@ MLflow registra parámetros y métricas del entrenamiento, incluyendo `deploy_mo
 7. El navegador muestra únicamente la respuesta cuyo UUID coincide con su petición.
 
 El endpoint REST de respuesta se conserva como compatibilidad y diagnóstico, pero el flujo normal de la interfaz Kafka presenta la predicción mediante WebSocket.
+
+La primera predicción tras arrancar o reiniciar el predictor puede tardar más que las siguientes. Es normal que el primer micro-batch necesite 20-40 segundos por carga de modelos desde MinIO, warmup de JVM/Spark y negociación de offsets Kafka. `practica.sh` usa un margen mayor para esta validación inicial y mantiene el fallo si no llega una respuesta real.
 
 ### Servicios y puertos
 
@@ -225,8 +227,8 @@ Crear el cluster zonal:
 gcloud container clusters create "$CLUSTER" \
   --zone="$ZONE" \
   --num-nodes=2 \
-  --machine-type=e2-standard-2 \
-  --disk-type=pd-balanced \
+  --machine-type=e2-standard-4 \
+  --disk-type=pd-ssd \
   --disk-size=100 \
   --enable-ip-alias \
   --project="$PROJECT_ID"
@@ -248,7 +250,9 @@ gcloud container clusters resize "$CLUSTER" \
   --quiet
 ```
 
-La opción `2` de `practica.sh` vuelve a escalar automáticamente el cluster al número de nodos indicado por `K8S_NODE_COUNT`, con valor predeterminado `2`. `e2-standard-2` usa 4 vCPU totales con dos nodos y suele caber en la cuota inicial; usa `e2-standard-4` solo si el proyecto tiene al menos 8 vCPU regionales disponibles.
+La opción `2` de `practica.sh` vuelve a escalar automáticamente el cluster al número de nodos indicado por `K8S_NODE_COUNT`, con valor predeterminado `2`.
+
+La configuración verificada end-to-end para la práctica usa dos nodos `e2-standard-4`: 8 vCPU regionales en total y disco suficiente para dos nodos. Con `pd-ssd` de 100 GB por nodo necesitas al menos 200 GB de cuota `SSD_TOTAL_GB` libre en la región. `practica.sh` puede intentar un fallback a 1 nodo si no hay cuota, pero ese modo solo sirve para arrancar parcialmente; para demostrar distribución real en Spark `deploy-mode cluster` hacen falta dos nodos y dos workers en nodos distintos.
 
 Consulta las cuotas antes de crear el cluster:
 
@@ -256,12 +260,32 @@ Consulta las cuotas antes de crear el cluster:
 REGION="${ZONE%-*}"
 gcloud compute regions describe "$REGION" \
   --flatten="quotas[]" \
-  --filter="quotas.metric=CPUS" \
+  --filter="quotas.metric=(CPUS SSD_TOTAL_GB)" \
   --format="table(quotas.metric,quotas.usage,quotas.limit)"
 gcloud compute project-info describe \
   --flatten="quotas[]" \
   --filter="quotas.metric=CPUS_ALL_REGIONS" \
   --format="table(quotas.metric,quotas.usage,quotas.limit)"
+```
+
+Si falta cuota SSD, libera discos o VMs que no uses y vuelve a escalar:
+
+```bash
+gcloud compute instances list --project="$PROJECT_ID"
+gcloud compute disks list --project="$PROJECT_ID"
+gcloud compute disks list \
+  --filter="-users:*" \
+  --format="table(name,zone.basename(),sizeGb,type.basename())" \
+  --project="$PROJECT_ID"
+
+# Solo para discos realmente prescindibles:
+gcloud compute disks delete NOMBRE_DISCO --zone=ZONA --project="$PROJECT_ID"
+
+gcloud container clusters resize "$CLUSTER" \
+  --num-nodes=2 \
+  --zone="$ZONE" \
+  --project="$PROJECT_ID" \
+  --quiet
 ```
 
 ### Firewall NodePort de GKE
@@ -453,7 +477,7 @@ practica.sh -> 9         Limpiar checkpoints S3A Docker
 practica.sh -> 11        Logs por servicio
 ```
 
-La versión actual espera explícitamente a que Cassandra acepte CQL y a que Flask arranque conectado a Cassandra antes de continuar. Si un arranque fue interrumpido en una VM lenta, vuelve a ejecutar `./practica.sh` opción `1`; el script recrea tablas, recarga distancias, rehace Iceberg, reentrena y arranca el predictor sin intervención manual.
+La versión actual espera explícitamente a que Cassandra acepte CQL y a que Flask arranque conectado a Cassandra antes de continuar. En Docker Compose, Flask depende de Cassandra mediante `depends_on` con `service_healthy`; además, el bootstrap de Cassandra, distancias, MinIO/Iceberg y modelos es idempotente. Si un arranque fue interrumpido en una VM lenta, vuelve a ejecutar `./practica.sh` opción `1`; el script recrea tablas, recarga distancias, rehace Iceberg, reentrena y arranca el predictor sin intervención manual.
 
 ### Error 2: MLflow vacío o `TrainModel` no registra runs
 
@@ -581,13 +605,32 @@ Estos roles son amplios para una práctica reproducible; en producción deben su
 
 ### Error 14: no hay cuota para crear dos nodos GKE
 
-Crea el cluster con `e2-standard-2` y dos nodos: consume 4 vCPU frente a las 8 vCPU de `e2-standard-4` por dos nodos. Comprueba `CPUS` regional y `CPUS_ALL_REGIONS` con los comandos de la sección de creación del cluster. Si aún no cabe, solicita aumento de cuota en:
+La práctica verificada usa dos nodos `e2-standard-4`: 8 vCPU regionales y disco SSD suficiente. Comprueba `CPUS`, `CPUS_ALL_REGIONS` y `SSD_TOTAL_GB` con los comandos de la sección de creación del cluster. Si falta SSD, borra discos o VMs no usados y vuelve a escalar:
+
+```bash
+gcloud compute disks list --project="$PROJECT_ID"
+gcloud compute disks list \
+  --filter="-users:*" \
+  --format="table(name,zone.basename(),sizeGb,type.basename())" \
+  --project="$PROJECT_ID"
+
+# Solo para discos realmente prescindibles:
+gcloud compute disks delete NOMBRE_DISCO --zone=ZONA --project="$PROJECT_ID"
+
+gcloud container clusters resize practica-k8s \
+  --num-nodes=2 \
+  --zone=europe-southwest1-a \
+  --project="$PROJECT_ID" \
+  --quiet
+```
+
+Si aún no cabe, solicita aumento de cuota en:
 
 ```text
 https://console.cloud.google.com/iam-admin/quotas
 ```
 
-Como último recurso puede usarse temporalmente `K8S_NODE_COUNT=1 ./practica.sh 2`, pero la evidencia distribuida debe realizarse con dos workers.
+Como último recurso puede usarse temporalmente `K8S_NODE_COUNT=1 ./practica.sh 2`, pero la evidencia distribuida y la validación final deben realizarse con dos nodos y dos workers en nodos distintos.
 
 ### Error 15: `ImagePullBackOff` en imágenes propias
 
@@ -599,6 +642,39 @@ kubectl describe pod NOMBRE_DEL_POD
 ```
 
 No edites los manifests con un Project ID fijo. `practica.sh` sustituye `PRACTICA_REGISTRY` y `PRACTICA_TAG` en copias temporales antes de aplicar los YAML.
+
+### Error 16: Kafka en K8s arranca pero no queda `1/1 Ready`
+
+Si el broker elige líder KRaft pero los clientes dentro del propio pod no pueden listar topics, puede ser el problema de hairpin del Service: el cliente hace bootstrap local, Kafka devuelve `advertised.listeners=kafka:9092`, y el cliente intenta volver al broker pasando por la ClusterIP del Service.
+
+La imagen actual evita ese loopback con dos listeners:
+
+```text
+PLAINTEXT://kafka:9092        Clientes de otros pods: Flask, Spark, Airflow
+INTERNAL://localhost:29092    Bootstrap local del pod Kafka y readinessProbe
+```
+
+`docker/kafka/start-kafka.sh` anuncia ambos listeners y crea los topics usando `localhost:29092`. En GKE, `k8s-gke/kafka.yaml` mantiene el Service en `9092` para el resto del cluster, pero el `readinessProbe` usa `localhost:29092` y un `timeoutSeconds` amplio para absorber el arranque de la JVM de Kafka.
+
+Diagnóstico rápido:
+
+```bash
+kubectl get pods -l app=kafka -o wide
+kubectl exec deployment/kafka -- /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092
+kubectl exec deployment/kafka -- /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list
+kubectl exec deployment/flask -- python3 -c "from kafka.admin import KafkaAdminClient; c=KafkaAdminClient(bootstrap_servers='kafka:9092'); print(c.list_topics()); c.close()"
+```
+
+### Error 17: la primera predicción tras arrancar el predictor tarda más
+
+La primera petición después de arrancar `MakePrediction` puede tardar 20-40 segundos, y en máquinas lentas algo más, porque Spark carga los modelos desde MinIO, calienta la JVM y negocia offsets con Kafka. Esto no indica fallo si el driver está en `RUNNING` con worker asignado y los streams están activos.
+
+`practica.sh` usa un timeout ampliado para la predicción inicial tras levantar el predictor y conserva el timeout normal para diagnósticos posteriores. Si quieres ajustar los márgenes sin editar código:
+
+```bash
+PREDICTION_COLD_START_TIMEOUT_SECONDS=240 ./practica.sh 2
+PREDICTION_TIMEOUT_SECONDS=180 ./practica.sh 10 c
+```
 
 ## Versiones Instaladas
 

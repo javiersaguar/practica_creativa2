@@ -14,6 +14,9 @@ SPARK_HOME=~/spark-4.1.1
 PRACTICA_NONINTERACTIVE="${PRACTICA_NONINTERACTIVE:-0}"
 PRACTICA_ASSUME_YES="${PRACTICA_ASSUME_YES:-0}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "$PROJECT_HOME" rev-parse --short=12 HEAD 2>/dev/null || echo latest)}"
+PREDICTION_TIMEOUT_SECONDS="${PREDICTION_TIMEOUT_SECONDS:-120}"
+PREDICTION_COLD_START_TIMEOUT_SECONDS="${PREDICTION_COLD_START_TIMEOUT_SECONDS:-180}"
+PREDICTION_POLL_INTERVAL_SECONDS="${PREDICTION_POLL_INTERVAL_SECONDS:-3}"
 export PROJECT_HOME
 
 # PATH para spark-submit
@@ -258,20 +261,24 @@ raise SystemExit(1 if any(any(name in d.get("mainclass", "") for name in ("MakeP
 }
 
 run_e2e_docker_check() {
-  local uuid result status
+  local timeout="${1:-$PREDICTION_TIMEOUT_SECONDS}"
+  local interval="${2:-$PREDICTION_POLL_INTERVAL_SECONDS}"
+  local uuid result status deadline
   uuid="$(curl -fsS -X POST http://localhost:5001/flights/delays/predict/classify_realtime \
     -d "DepDelay=15&Carrier=AA&FlightDate=2016-12-25&Origin=ATL&Dest=SFO&FlightNum=1234" |
     python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)"
   [ -n "$uuid" ] || return 1
-  for _ in $(seq 1 40); do
+  deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
     result="$(curl -fsS "http://localhost:5001/flights/delays/predict/classify_realtime/response/$uuid" 2>/dev/null || true)"
     status="$(printf "%s" "$result" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("status",""))' 2>/dev/null)"
     if [ "$status" = "OK" ]; then
       echo "$result"
       return 0
     fi
-    sleep 3
+    sleep "$interval"
   done
+  echo "Timeout esperando prediccion tras ${timeout}s" >&2
   return 1
 }
 
@@ -513,12 +520,20 @@ print("TrainModel cluster:", drivers[0]["id"], drivers[0]["worker"])
 }
 
 run_e2e_k8s_check() {
-  kubectl exec -i deployment/flask -- python3 - <<'PY'
+  local timeout="${1:-$PREDICTION_TIMEOUT_SECONDS}"
+  local interval="${2:-$PREDICTION_POLL_INTERVAL_SECONDS}"
+  kubectl exec -i deployment/flask -- env \
+    PREDICTION_TIMEOUT_SECONDS="$timeout" \
+    PREDICTION_POLL_INTERVAL_SECONDS="$interval" \
+    python3 - <<'PY'
 import json
+import os
 import sys
 import time
 import requests
 
+timeout_seconds = int(os.environ.get("PREDICTION_TIMEOUT_SECONDS", "120"))
+poll_interval = int(os.environ.get("PREDICTION_POLL_INTERVAL_SECONDS", "3"))
 base = "http://localhost:5001/flights/delays/predict/classify_realtime"
 response = requests.post(base, data={
     "DepDelay": "15",
@@ -530,13 +545,14 @@ response = requests.post(base, data={
 }, timeout=15)
 response.raise_for_status()
 prediction_id = response.json()["id"]
-for _ in range(40):
+deadline = time.monotonic() + timeout_seconds
+while time.monotonic() < deadline:
     result = requests.get(f"{base}/response/{prediction_id}", timeout=15).json()
     if result.get("status") == "OK":
         print(json.dumps(result, sort_keys=True))
         raise SystemExit(0)
-    time.sleep(3)
-print("Timeout esperando prediccion", file=sys.stderr)
+    time.sleep(poll_interval)
+print(f"Timeout esperando prediccion tras {timeout_seconds}s", file=sys.stderr)
 raise SystemExit(1)
 PY
 }
@@ -842,9 +858,10 @@ PY
 
   info "DAG Airflow disponible para reentrenamiento manual"
 
-  info "Ejecutando prediccion end-to-end de validacion..."
+  info "Ejecutando prediccion end-to-end de validacion (cold start hasta ${PREDICTION_COLD_START_TIMEOUT_SECONDS}s)..."
   local e2e_result
-  e2e_result="$(run_e2e_docker_check)" || { err "La prediccion end-to-end fallo"; return 1; }
+  e2e_result="$(run_e2e_docker_check "$PREDICTION_COLD_START_TIMEOUT_SECONDS")" ||
+    { err "La prediccion end-to-end fallo"; return 1; }
   ok "Prediccion end-to-end correcta"
   echo "  $e2e_result"
 
@@ -1381,8 +1398,8 @@ PY
     return 1
   fi
 
-  info "Ejecutando prediccion end-to-end interna en K8s..."
-  run_e2e_k8s_check >/tmp/practica_k8s_e2e.json ||
+  info "Ejecutando prediccion end-to-end interna en K8s (cold start hasta ${PREDICTION_COLD_START_TIMEOUT_SECONDS}s)..."
+  run_e2e_k8s_check "$PREDICTION_COLD_START_TIMEOUT_SECONDS" >/tmp/practica_k8s_e2e.json ||
     { err "La prediccion end-to-end K8s fallo"; return 1; }
   ok "Prediccion end-to-end K8s correcta"
   K8S_E2E_UUID="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("id", ""))' \
@@ -1802,6 +1819,7 @@ diag_test_e2e_docker() {
   local endpoint="http://localhost:5001/flights/delays/predict/classify_realtime"
   local payload="DepDelay=15&Carrier=AA&FlightDate=2016-12-25&Origin=ATL&Dest=SFO&FlightNum=1234"
   local response body http_code uuid result result_body status prediction label failures=0
+  local timeout="${PREDICTION_TIMEOUT_SECONDS:-120}" deadline
 
   info "Enviando prediccion a Flask Docker..."
   response=$(curl -s -w "\nHTTP_CODE=%{http_code}\n" -X POST "$endpoint" -d "$payload" 2>/dev/null)
@@ -1826,20 +1844,21 @@ diag_test_e2e_docker() {
   fi
   pass_check "UUID generado: $uuid"
 
-  info "Esperando respuesta de Spark/Kafka (max 60s)..."
+  info "Esperando respuesta de Spark/Kafka (max ${timeout}s)..."
   status="TIMEOUT"
-  for _ in $(seq 1 20); do
+  deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
     result=$(curl -s -w "\nHTTP_CODE=%{http_code}\n" "$endpoint/response/$uuid" 2>/dev/null)
     result_body=$(printf "%s" "$result" | sed '/^HTTP_CODE=/d')
     status=$(JSON_BODY="$result_body" python3 -c 'import os,json; d=json.loads(os.environ.get("JSON_BODY","{}")); print(d.get("status",""))' 2>/dev/null)
     [ "$status" = "OK" ] && break
-    sleep 3
+    sleep "$PREDICTION_POLL_INTERVAL_SECONDS"
   done
 
   if [ "$status" = "OK" ]; then
     pass_check "Respuesta recibida por polling REST"
   else
-    fail_check "No se recibio respuesta en 60s"
+    fail_check "No se recibio respuesta en ${timeout}s"
     failures=$((failures + 1))
   fi
 
@@ -1884,6 +1903,7 @@ diag_test_e2e_k8s() {
   fi
 
   local node_ip endpoint payload response body http_code uuid result result_body status prediction label failures=0
+  local timeout="${PREDICTION_TIMEOUT_SECONDS:-120}" deadline
   node_ip=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null)
   if [ -z "$node_ip" ]; then
     err "No se pudo obtener la IP externa del nodo GKE"
@@ -1917,20 +1937,21 @@ diag_test_e2e_k8s() {
   fi
   pass_check "UUID generado: $uuid"
 
-  info "Esperando respuesta de Spark/Kafka en K8s (max 60s)..."
+  info "Esperando respuesta de Spark/Kafka en K8s (max ${timeout}s)..."
   status="TIMEOUT"
-  for _ in $(seq 1 20); do
+  deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
     result=$(curl -s -w "\nHTTP_CODE=%{http_code}\n" "$endpoint/response/$uuid" 2>/dev/null)
     result_body=$(printf "%s" "$result" | sed '/^HTTP_CODE=/d')
     status=$(JSON_BODY="$result_body" python3 -c 'import os,json; d=json.loads(os.environ.get("JSON_BODY","{}")); print(d.get("status",""))' 2>/dev/null)
     [ "$status" = "OK" ] && break
-    sleep 3
+    sleep "$PREDICTION_POLL_INTERVAL_SECONDS"
   done
 
   if [ "$status" = "OK" ]; then
     pass_check "Respuesta recibida por polling REST"
   else
-    fail_check "No se recibio respuesta en 60s"
+    fail_check "No se recibio respuesta en ${timeout}s"
     failures=$((failures + 1))
   fi
 
